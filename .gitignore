@@ -17,6 +17,9 @@ venv/
 # Claude Code
 .claude/
 
+# Binary samples / local test files
+dontupload/
+
 # OS
 .DS_Store
 Thumbs.db

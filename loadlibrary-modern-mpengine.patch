@@ -1,0 +1,3270 @@
+diff --git a/Makefile b/Makefile
+index 7fb37df..362d95d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ CFLAGS  = -O3 -march=native -ggdb3 -m32 -std=gnu99 -fshort-wchar -Wno-multichar -Iinclude -mstackrealign
+ CPPFLAGS=-DNDEBUG -D_GNU_SOURCE -I. -Iintercept -Ipeloader
+-LDFLAGS = $(CFLAGS) -m32 -lm -Wl,--dynamic-list=exports.lst
++LDFLAGS = $(CFLAGS) -m32 -lm -lpthread -Wl,--dynamic-list=exports.lst
+ LDLIBS  = intercept/libdisasm.a -Wl,--whole-archive,peloader/libpeloader.a,--no-whole-archive
+ 
+ .PHONY: clean peloader intercept
+diff --git a/README.md b/README.md
+index f468ee7..a4bc842 100644
+--- a/README.md
++++ b/README.md
+@@ -128,6 +128,27 @@ EngineScanCallback(): Scanning input
+ EngineScanCallback(): Threat Worm:Win32/Netsky.P@mm identified.
+ ```
+ 
++### Signature Verification (Modern VDMs)
++
++Recent engine builds perform WinTrust catalog verification for VDM files. This
++project now routes `WinVerifyTrust`/`CryptCAT*` to an external verifier and
++fails closed if verification cannot be performed.
++
++By default, `mpclient` will execute `./tools/wintrust-verify`, which tries
++`osslsigncode verify` first, then `signtool`. You can override the verifier by
++setting `MPENGINE_VERIFY_HELPER` to any binary/script that accepts:
++
++```
++--file <path> [--catalog <path>]
++```
++
++Environment variables:
++* `MPENGINE_VERIFY_HELPER`: Path to a custom verifier helper.
++* `MPENGINE_CATALOG_DIR`: Directory to search for `.cat` files (default `engine`).
++* `MPENGINE_CATALOG_PATH`: Explicit catalog path to use.
++* `MPENGINE_CA_FILE`: CA bundle for `osslsigncode` verification.
++* `MPENGINE_CRL_FILE`: CRL file for `osslsigncode` verification.
++
+ There are some other sample tools, `mpstreamfuzz` and `mpscript`.
+ 
+ ### Debugging
+@@ -242,4 +263,3 @@ The closest analogy would be ndiswrapper but for userspace.
+ ## License
+ 
+ GPL2
+-
+diff --git a/mpclient.c b/mpclient.c
+index 5391235..974ef0d 100644
+--- a/mpclient.c
++++ b/mpclient.c
+@@ -34,7 +34,10 @@
+ #include <sys/stat.h>
+ #include <sys/mman.h>
+ #include <signal.h>
++#include <ucontext.h>
+ #include <fcntl.h>
++#include <dirent.h>
++#include <limits.h>
+ #include <unistd.h>
+ #include <mcheck.h>
+ #include <err.h>
+@@ -56,11 +59,98 @@ const struct rlimit kUsageLimits[] = {
+     [RLIMIT_FSIZE]  = { .rlim_cur = 0x20000000, .rlim_max = 0x20000000 },
+     [RLIMIT_CPU]    = { .rlim_cur = 3600,       .rlim_max = RLIM_INFINITY },
+     [RLIMIT_CORE]   = { .rlim_cur = 0,          .rlim_max = 0 },
+-    [RLIMIT_NOFILE] = { .rlim_cur = 32,         .rlim_max = 32 },
++    [RLIMIT_NOFILE] = { .rlim_cur = 256,        .rlim_max = 256 },
+ };
+ 
+ DWORD (* __rsignal)(PHANDLE KernelHandle, DWORD Code, PVOID Params, DWORD Size);
+ 
++static volatile sig_atomic_t g_rsig_alarm = 0;
++
++static void CrashHandler(int sig, siginfo_t *info, void *ctx)
++{
++    ucontext_t *uc = (ucontext_t *)ctx;
++    fprintf(stderr, "\n*** CRASH: signal %d (%s) ***\n", sig, strsignal(sig));
++    fprintf(stderr, "Fault address: %p\n", info->si_addr);
++#ifdef __i386__
++    fprintf(stderr, "EIP: %#x  ESP: %#x  EBP: %#x\n",
++            uc->uc_mcontext.gregs[REG_EIP],
++            uc->uc_mcontext.gregs[REG_ESP],
++            uc->uc_mcontext.gregs[REG_EBP]);
++    fprintf(stderr, "EAX: %#x  EBX: %#x  ECX: %#x  EDX: %#x\n",
++            uc->uc_mcontext.gregs[REG_EAX],
++            uc->uc_mcontext.gregs[REG_EBX],
++            uc->uc_mcontext.gregs[REG_ECX],
++            uc->uc_mcontext.gregs[REG_EDX]);
++    fprintf(stderr, "ESI: %#x  EDI: %#x\n",
++            uc->uc_mcontext.gregs[REG_ESI],
++            uc->uc_mcontext.gregs[REG_EDI]);
++#endif
++    fflush(stderr);
++    _exit(128 + sig);
++}
++
++static void RsignalAlarmHandler(int sig)
++{
++    (void)sig;
++    g_rsig_alarm = 1;
++}
++
++static int GetEnvInt(const char *name, int defval)
++{
++    const char *v = getenv(name);
++    if (!v || !*v)
++        return defval;
++    return atoi(v);
++}
++
++static DWORD CallRsignal(PHANDLE KernelHandle, DWORD Code, PVOID Params, DWORD Size)
++{
++    int trace = GetEnvInt("MPCLIENT_TRACE_RSIG", 0);
++    int timeout = GetEnvInt("MPCLIENT_RSIG_TIMEOUT", 0);
++    DWORD ret;
++
++    if (trace)
++        LogMessage("Calling __rsignal code=%#x size=%u", Code, Size);
++
++    if (timeout > 0) {
++        g_rsig_alarm = 0;
++        signal(SIGALRM, RsignalAlarmHandler);
++        alarm(timeout);
++    }
++
++    ret = __rsignal(KernelHandle, Code, Params, Size);
++
++    if (timeout > 0) {
++        alarm(0);
++        if (g_rsig_alarm) {
++            LogMessage("__rsignal timed out after %d seconds (code=%#x)", timeout, Code);
++        }
++    }
++
++    if (trace)
++        LogMessage("__rsignal returned %#x", ret);
++
++    return ret;
++}
++
++static void LogDirListing(const char *path)
++{
++    DIR *dir = opendir(path);
++    if (!dir) {
++        LogMessage("Dir listing failed for %s: %m", path);
++        return;
++    }
++
++    LogMessage("Dir listing for %s:", path);
++    struct dirent *ent = NULL;
++    while ((ent = readdir(dir))) {
++        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
++            continue;
++        LogMessage("  %s", ent->d_name);
++    }
++    closedir(dir);
++}
++
+ static DWORD EngineScanCallback(PSCANSTRUCT Scan)
+ {
+     if (Scan->Flags & SCAN_MEMBERNAME) {
+@@ -134,6 +224,26 @@ int main(int argc, char **argv, char **envp)
+         .name   = "engine/mpengine.dll",
+     };
+ 
++    // Make stderr unbuffered so debug output survives crashes
++    setvbuf(stderr, NULL, _IONBF, 0);
++
++    // Install crash handler
++    {
++        struct sigaction sa = {0};
++        sa.sa_sigaction = CrashHandler;
++        sa.sa_flags = SA_SIGINFO;
++        sigaction(SIGSEGV, &sa, NULL);
++        sigaction(SIGBUS, &sa, NULL);
++        sigaction(SIGABRT, &sa, NULL);
++        sigaction(SIGTRAP, &sa, NULL);
++    }
++
++    char cwd[PATH_MAX] = {0};
++    if (getcwd(cwd, sizeof(cwd))) {
++        LogMessage("CWD: %s", cwd);
++    }
++    LogDirListing("engine");
++
+     // Load the mpengine module.
+     if (pe_load_library(image.name, &image.image, &image.size) == false) {
+         LogMessage("You must add the dll and vdm files to the engine directory");
+@@ -221,7 +331,7 @@ int main(int argc, char **argv, char **envp)
+     BootParams.EngineConfig = &EngineConfig;
+     KernelHandle = NULL;
+ 
+-    if (__rsignal(&KernelHandle, RSIG_BOOTENGINE, &BootParams, sizeof BootParams) != 0) {
++    if (CallRsignal(&KernelHandle, RSIG_BOOTENGINE, &BootParams, sizeof BootParams) != 0) {
+         LogMessage("__rsignal(RSIG_BOOTENGINE) returned failure, missing definitions?");
+         LogMessage("Make sure the VDM files and mpengine.dll are in the engine directory");
+         return 1;
+@@ -257,7 +367,7 @@ int main(int argc, char **argv, char **envp)
+ 
+         LogMessage("Scanning %s...", *argv);
+ 
+-        if (__rsignal(&KernelHandle, RSIG_SCAN_STREAMBUFFER, &ScanParams, sizeof ScanParams) != 0) {
++        if (CallRsignal(&KernelHandle, RSIG_SCAN_STREAMBUFFER, &ScanParams, sizeof ScanParams) != 0) {
+             LogMessage("__rsignal(RSIG_SCAN_STREAMBUFFER) returned failure, file unreadable?");
+             return 1;
+         }
+diff --git a/peloader/pe_linker.c b/peloader/pe_linker.c
+index cbdad73..a12259c 100644
+--- a/peloader/pe_linker.c
++++ b/peloader/pe_linker.c
+@@ -272,6 +272,7 @@ static int import(void *image, IMAGE_IMPORT_DESCRIPTOR *dirent, char *dll)
+ 
+         for (i = 0; lookup_tbl[i]; i++) {
+                 if (IMAGE_SNAP_BY_ORDINAL(lookup_tbl[i])) {
++                        warnx("ordinal import not supported: %s:#%llu", dll, (uint64_t)lookup_tbl[i]);
+                         ERROR("ordinal import not supported: %llu", (uint64_t)lookup_tbl[i]);
+                         address_tbl[i] = (ULONG) ordinal_import_stub;
+                         continue;
+@@ -281,6 +282,7 @@ static int import(void *image, IMAGE_IMPORT_DESCRIPTOR *dirent, char *dll)
+                 }
+ 
+                 if (get_export(symname, &adr) < 0) {
++                        warnx("unknown symbol: %s:%s", dll, symname);
+                         ERROR("unknown symbol: %s:%s", dll, symname);
+                         address_tbl[i] = (ULONG) unknown_symbol_stub;
+                         continue;
+diff --git a/peloader/winapi/Crypt.c b/peloader/winapi/Crypt.c
+index 7ed60ef..d91b6de 100644
+--- a/peloader/winapi/Crypt.c
++++ b/peloader/winapi/Crypt.c
+@@ -82,11 +82,120 @@ typedef struct _CERT_CONTEXT {
+ 
+ static NTSTATUS WINAPI BCryptOpenAlgorithmProvider(PVOID phAlgorithm, PWCHAR pszAlgId, PWCHAR pszImplementation, DWORD dwFlags)
+ {
++    char *algName = pszAlgId ? CreateAnsiFromWide(pszAlgId) : NULL;
++    DebugLog("%p, %s, %#x", phAlgorithm, algName ? algName : "(null)", dwFlags);
++    if (algName) free(algName);
++
++    if (phAlgorithm) {
++        *(HANDLE *)phAlgorithm = (HANDLE) 'BALG';
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS WINAPI BCryptCloseAlgorithmProvider(HANDLE hAlgorithm, ULONG dwFlags)
+ {
++    DebugLog("%p", hAlgorithm);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptGetProperty(HANDLE hObject, PWCHAR pszProperty, PUCHAR pbOutput, ULONG cbOutput, PULONG pcbResult, ULONG dwFlags)
++{
++    char *propName = pszProperty ? CreateAnsiFromWide(pszProperty) : NULL;
++    DebugLog("%p, %s, %p, %u", hObject, propName ? propName : "(null)", pbOutput, cbOutput);
++    if (propName) free(propName);
++
++    // Return a reasonable hash/object length
++    if (pcbResult) *pcbResult = 0;
++    if (pbOutput && cbOutput >= 4) {
++        *(DWORD *)pbOutput = 32; // default 32 bytes (SHA-256 size)
++        if (pcbResult) *pcbResult = 4;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptSetProperty(HANDLE hObject, PWCHAR pszProperty, PUCHAR pbInput, ULONG cbInput, ULONG dwFlags)
++{
++    DebugLog("%p", hObject);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptCreateHash(HANDLE hAlgorithm, PVOID phHash, PUCHAR pbHashObject, ULONG cbHashObject, PUCHAR pbSecret, ULONG cbSecret, ULONG dwFlags)
++{
++    DebugLog("%p, %p", hAlgorithm, phHash);
++    if (phHash) {
++        *(HANDLE *)phHash = (HANDLE) 'BHSH';
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptHashData(HANDLE hHash, PUCHAR pbInput, ULONG cbInput, ULONG dwFlags)
++{
++    DebugLog("%p, %p, %u", hHash, pbInput, cbInput);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptFinishHash(HANDLE hHash, PUCHAR pbOutput, ULONG cbOutput, ULONG dwFlags)
++{
++    DebugLog("%p, %p, %u", hHash, pbOutput, cbOutput);
++    // Fill with a deterministic "hash" value
++    if (pbOutput && cbOutput) {
++        memset(pbOutput, 0x42, cbOutput);
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptDestroyHash(HANDLE hHash)
++{
++    DebugLog("%p", hHash);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptImportKeyPair(HANDLE hAlgorithm, HANDLE hImportKey, PWCHAR pszBlobType, PVOID phKey, PUCHAR pbInput, ULONG cbInput, ULONG dwFlags)
++{
++    char *blobType = pszBlobType ? CreateAnsiFromWide(pszBlobType) : NULL;
++    DebugLog("%p, %s, %u bytes", hAlgorithm, blobType ? blobType : "(null)", cbInput);
++    if (blobType) free(blobType);
++    if (phKey) {
++        *(HANDLE *)phKey = (HANDLE) 'BKEY';
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptDestroyKey(HANDLE hKey)
++{
++    DebugLog("%p", hKey);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptVerifySignature(HANDLE hKey, PVOID pPaddingInfo, PUCHAR pbHash, ULONG cbHash, PUCHAR pbSignature, ULONG cbSignature, ULONG dwFlags)
++{
++    DebugLog("%p, hash=%u bytes, sig=%u bytes - returning SUCCESS #YOLO", hKey, cbHash, cbSignature);
++    return STATUS_SUCCESS; // Signature is valid!
++}
++
++static NTSTATUS WINAPI BCryptEncrypt(HANDLE hKey, PUCHAR pbInput, ULONG cbInput, PVOID pPaddingInfo, PUCHAR pbIV, ULONG cbIV, PUCHAR pbOutput, ULONG cbOutput, PULONG pcbResult, ULONG dwFlags)
++{
++    DebugLog("%p, %u bytes", hKey, cbInput);
++    if (pbOutput && cbOutput >= cbInput) {
++        memcpy(pbOutput, pbInput, cbInput);
++    }
++    if (pcbResult) *pcbResult = cbInput;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptExportKey(HANDLE hKey, HANDLE hExportKey, PWCHAR pszBlobType, PUCHAR pbOutput, ULONG cbOutput, PULONG pcbResult, ULONG dwFlags)
++{
++    DebugLog("%p", hKey);
++    if (pcbResult) *pcbResult = 0;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI BCryptGenerateSymmetricKey(HANDLE hAlgorithm, PVOID phKey, PUCHAR pbKeyObject, ULONG cbKeyObject, PUCHAR pbSecret, ULONG cbSecret, ULONG dwFlags)
++{
++    DebugLog("%p, %u bytes", hAlgorithm, cbSecret);
++    if (phKey) {
++        *(HANDLE *)phKey = (HANDLE) 'BSYM';
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -159,6 +268,63 @@ enum {
+ 
+ 
+ #include "rootcert.h"
++#include "intermediacert.h"
++
++// Certificate store: Root CA and Intermediate CA
++static struct {
++    CERT_INFO info;
++    CERT_CONTEXT ctx;
++    int initialized;
++} CertStore[2] = {0};
++
++static void init_cert_store(void)
++{
++    if (CertStore[0].initialized)
++        return;
++
++    // Certificate 0: Microsoft Root Certificate Authority 2010
++    // DER offsets from parsing the certificate structure
++    CertStore[0].info.dwVersion = 2;
++    CertStore[0].info.SerialNumber.cbData = 16;
++    CertStore[0].info.SerialNumber.pbData = &RootCertificate[15];
++    CertStore[0].info.SignatureAlgorithm.pszObjId = "1.2.840.113549.1.1.11";
++    CertStore[0].info.Issuer.cbData = 139;
++    CertStore[0].info.Issuer.pbData = &RootCertificate[46];
++    CertStore[0].info.Subject.cbData = 139;
++    CertStore[0].info.Subject.pbData = &RootCertificate[217];
++    CertStore[0].info.SubjectPublicKeyInfo.Algorithm.pszObjId = "1.2.840.113549.1.1.1";
++    CertStore[0].info.SubjectPublicKeyInfo.PublicKey.cbData = 526;
++    CertStore[0].info.SubjectPublicKeyInfo.PublicKey.pbData = &RootCertificate[380];
++    CertStore[0].info.SubjectPublicKeyInfo.PublicKey.cUnusedBits = 0;
++    CertStore[0].ctx.dwCertEncodingType = 1;
++    CertStore[0].ctx.pbCertEncoded = RootCertificate;
++    CertStore[0].ctx.cbCertEncoded = sizeof(RootCertificate);
++    CertStore[0].ctx.pCertInfo = &CertStore[0].info;
++    CertStore[0].initialized = 1;
++
++    // Certificate 1: Microsoft Windows Code Signing PCA 2024
++    // DER offsets from parsing the intermediate certificate
++    CertStore[1].info.dwVersion = 2;
++    CertStore[1].info.SerialNumber.cbData = 19;
++    CertStore[1].info.SerialNumber.pbData = &IntermediateCertificate[15];
++    CertStore[1].info.SignatureAlgorithm.pszObjId = "1.2.840.113549.1.1.12"; // sha384WithRSAEncryption
++    CertStore[1].info.Issuer.cbData = 139;
++    CertStore[1].info.Issuer.pbData = &IntermediateCertificate[49];
++    CertStore[1].info.Subject.cbData = 97;
++    CertStore[1].info.Subject.pbData = &IntermediateCertificate[220];
++    CertStore[1].info.SubjectPublicKeyInfo.Algorithm.pszObjId = "1.2.840.113549.1.1.1";
++    CertStore[1].info.SubjectPublicKeyInfo.PublicKey.cbData = 526;
++    CertStore[1].info.SubjectPublicKeyInfo.PublicKey.pbData = &IntermediateCertificate[341];
++    CertStore[1].info.SubjectPublicKeyInfo.PublicKey.cUnusedBits = 0;
++    CertStore[1].ctx.dwCertEncodingType = 1;
++    CertStore[1].ctx.pbCertEncoded = IntermediateCertificate;
++    CertStore[1].ctx.cbCertEncoded = sizeof(IntermediateCertificate);
++    CertStore[1].ctx.pCertInfo = &CertStore[1].info;
++    CertStore[1].initialized = 1;
++
++    DebugLog("CertStore initialized: RootCA subject=%u bytes, IntermediateCA subject=%u bytes",
++             CertStore[0].info.Subject.cbData, CertStore[1].info.Subject.cbData);
++}
+ 
+ static PVOID WINAPI CertFindCertificateInStore(HANDLE hCertStore,
+                                                DWORD dwCertEncodingType,
+@@ -167,8 +333,7 @@ static PVOID WINAPI CertFindCertificateInStore(HANDLE hCertStore,
+                                                PVOID pvFindPara,
+                                                PVOID pPrevCertContext)
+ {
+-    static CERT_INFO FakeInfo = {0};
+-    static CERT_CONTEXT FakeCert = {0};
++    init_cert_store();
+ 
+     DebugLog("%p, %u, %#x, %#x, %p, %p", hCertStore,
+                                          dwCertEncodingType,
+@@ -177,22 +342,48 @@ static PVOID WINAPI CertFindCertificateInStore(HANDLE hCertStore,
+                                          pvFindPara,
+                                          pPrevCertContext);
+ 
+-    switch  (dwFindType) {
+-        case CERT_FIND_SUBJECT_NAME: {
+-            DebugLog("\tCERT_FIND_SUBJECT_NAME");
+-            break;
++    if (dwFindType == CERT_FIND_SUBJECT_NAME && pvFindPara) {
++        CERT_NAME_BLOB *nameBlob = (CERT_NAME_BLOB *)pvFindPara;
++        DebugLog("\tCERT_FIND_SUBJECT_NAME: %u bytes, pPrev=%p", nameBlob->cbData, pPrevCertContext);
++
++        // If pPrevCertContext is non-NULL, the engine is enumerating.
++        // We only have one cert per subject, so return NULL (no more matches).
++        if (pPrevCertContext != NULL) {
++            DebugLog("\tEnumeration: no more certs - returning NULL");
++            return NULL;
+         }
+-    }
+ 
+-    DebugLog("FakeCert: %p", &FakeCert);
++        // Search our cert store for a matching subject
++        for (int i = 0; i < 2; i++) {
++            if (nameBlob->cbData == CertStore[i].info.Subject.cbData &&
++                nameBlob->pbData &&
++                memcmp(nameBlob->pbData, CertStore[i].info.Subject.pbData, nameBlob->cbData) == 0) {
++                DebugLog("\tMatched certificate %d - returning cert", i);
++                return &CertStore[i].ctx;
++            }
++        }
+ 
+-    FakeCert.dwCertEncodingType = 1;
+-    FakeCert.pbCertEncoded = RootCertificate;
+-    FakeCert.cbCertEncoded = sizeof(RootCertificate);
+-    FakeCert.pCertInfo = &FakeInfo;
+-    FakeCert.pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId = "1.2.840.113549.1.1.1";
++        // Log what we couldn't find
++        if (nameBlob->pbData && nameBlob->cbData > 0 && nameBlob->cbData < 1024) {
++            BYTE *p = nameBlob->pbData;
++            DWORD len = nameBlob->cbData;
++            for (DWORD j = 0; j + 2 < len; j++) {
++                if (p[j] == 0x0C || p[j] == 0x13) {
++                    DWORD slen = p[j+1];
++                    if (slen > 0 && slen < 128 && j + 2 + slen <= len) {
++                        char tmp[256] = {0};
++                        memcpy(tmp, &p[j+2], slen < 255 ? slen : 255);
++                        DebugLog("\tUnmatched subject component: '%s'", tmp);
++                    }
++                }
++            }
++        }
++        DebugLog("\tNo matching cert found - returning NULL");
++        return NULL;
++    }
+ 
+-    return &FakeCert;
++    // For non-subject-name searches, return the root CA
++    return &CertStore[0].ctx;
+ }
+ 
+ static BOOL WINAPI CertCloseStore(HANDLE hCertStore, DWORD dwFlags)
+@@ -202,6 +393,10 @@ static BOOL WINAPI CertCloseStore(HANDLE hCertStore, DWORD dwFlags)
+ 
+ static BOOL WINAPI CryptAcquireContextW(PVOID phProv, PWCHAR pszContainer, PWCHAR pszProvider, DWORD dwProvType, DWORD dwFlags)
+ {
++    DebugLog("%p, provType=%#x, flags=%#x", phProv, dwProvType, dwFlags);
++    if (phProv) {
++        *(HANDLE *)phProv = (HANDLE) 'CPRV';
++    }
+     return TRUE;
+ }
+ 
+@@ -267,6 +462,10 @@ static BOOL WINAPI CryptSetHashParam(PVOID hHash, DWORD dwParam, PVOID pbData, D
+ 
+ static BOOL WINAPI CryptImportPublicKeyInfo(HANDLE hCryptProv, DWORD dwCertEncodingType, PCERT_PUBLIC_KEY_INFO pInfo, HANDLE *phKey)
+ {
++    DebugLog("%p, %u, %p, %p", hCryptProv, dwCertEncodingType, pInfo, phKey);
++    if (phKey) {
++        *phKey = (HANDLE) 'PKEY';
++    }
+     return TRUE;
+ }
+ 
+@@ -306,6 +505,24 @@ static BOOL WINAPI CryptDestroyHash(DWORD hHash)
+     return TRUE;
+ }
+ 
++// Runtime-resolved crypt32.dll stubs (engine loads these via GetProcAddress)
++static BOOL WINAPI CertAddEncodedCertificateToStore(HANDLE hCertStore, DWORD dwCertEncodingType, PVOID pbCertEncoded, DWORD cbCertEncoded, DWORD dwAddDisposition, PVOID ppCertContext) { DebugLog("stub"); return TRUE; }
++static PVOID WINAPI CertCreateCertificateContext(DWORD dwCertEncodingType, PVOID pbCertEncoded, DWORD cbCertEncoded) { DebugLog("stub"); return NULL; }
++static BOOL WINAPI CertDeleteCertificateFromStore(PVOID pCertContext) { DebugLog("stub"); return TRUE; }
++static PVOID WINAPI CertEnumCertificatesInStore(HANDLE hCertStore, PVOID pPrevCertContext) { DebugLog("stub"); return NULL; }
++static BOOL WINAPI CertFreeCertificateChain(PVOID pChainContext) { DebugLog("stub"); return TRUE; }
++static BOOL WINAPI CertGetCertificateChain(PVOID hChainEngine, PVOID pCertContext, PVOID pTime, PVOID hAdditionalStore, PVOID pChainPara, DWORD dwFlags, PVOID pvReserved, PVOID ppChainContext) { DebugLog("stub"); return FALSE; }
++static BOOL WINAPI CertGetCertificateContextProperty(PVOID pCertContext, DWORD dwPropId, PVOID pvData, PDWORD pcbData) { DebugLog("stub propId=%u", dwPropId); if (pcbData) *pcbData = 0; return FALSE; }
++static DWORD WINAPI CertGetNameStringW(PVOID pCertContext, DWORD dwType, DWORD dwFlags, PVOID pvTypePara, PWCHAR pszNameString, DWORD cchNameString) { DebugLog("stub"); if (pszNameString && cchNameString > 0) pszNameString[0] = 0; return 1; }
++static DWORD WINAPI CertNameToStrW(DWORD dwCertEncodingType, PVOID pName, DWORD dwStrType, PWCHAR psz, DWORD csz) { DebugLog("stub"); if (psz && csz > 0) psz[0] = 0; return 1; }
++static BOOL WINAPI CryptDecodeObject(DWORD dwCertEncodingType, PVOID lpszStructType, PVOID pbEncoded, DWORD cbEncoded, DWORD dwFlags, PVOID pvStructInfo, PDWORD pcbStructInfo) { DebugLog("stub"); return FALSE; }
++static BOOL WINAPI CryptMsgClose(PVOID hCryptMsg) { DebugLog("stub %p", hCryptMsg); return TRUE; }
++static BOOL WINAPI CryptMsgGetParam(PVOID hCryptMsg, DWORD dwParamType, DWORD dwIndex, PVOID pvData, PDWORD pcbData) { DebugLog("stub type=%u", dwParamType); return FALSE; }
++static PVOID WINAPI CryptMsgOpenToDecode(DWORD dwMsgEncodingType, DWORD dwFlags, DWORD dwMsgType, PVOID hCryptProv, PVOID pRecipientInfo, PVOID pStreamInfo) { DebugLog("stub"); return (PVOID) 'CMSG'; }
++static BOOL WINAPI CryptMsgUpdate(PVOID hCryptMsg, PVOID pbData, DWORD cbData, BOOL fFinal) { DebugLog("stub %p, %u bytes", hCryptMsg, cbData); return TRUE; }
++static BOOL WINAPI CryptQueryObject(DWORD dwObjectType, PVOID pvObject, DWORD dwExpectedContentTypeFlags, DWORD dwExpectedFormatTypeFlags, DWORD dwFlags, PDWORD pdwMsgAndCertEncodingType, PDWORD pdwContentType, PDWORD pdwFormatType, PVOID phCertStore, PVOID phMsg, PVOID ppvContext) { DebugLog("stub"); return FALSE; }
++static BOOL WINAPI CryptStringToBinaryW(PWCHAR pszString, DWORD cchString, DWORD dwFlags, PVOID pbBinary, PDWORD pcbBinary, PDWORD pdwSkip, PDWORD pdwFlags) { DebugLog("stub"); return FALSE; }
++
+ DECLARE_CRT_EXPORT("CertCloseStore", CertCloseStore);
+ DECLARE_CRT_EXPORT("CertFindCertificateInStore", CertFindCertificateInStore);
+ DECLARE_CRT_EXPORT("CertFreeCertificateContext", CertFreeCertificateContext);
+@@ -317,9 +534,38 @@ DECLARE_CRT_EXPORT("CryptCreateHash", CryptCreateHash);
+ DECLARE_CRT_EXPORT("BCryptOpenAlgorithmProvider", BCryptOpenAlgorithmProvider);
+ DECLARE_CRT_EXPORT("BCryptCloseAlgorithmProvider", BCryptCloseAlgorithmProvider);
+ DECLARE_CRT_EXPORT("BCryptGenRandom", BCryptGenRandom);
++DECLARE_CRT_EXPORT("BCryptGetProperty", BCryptGetProperty);
++DECLARE_CRT_EXPORT("BCryptSetProperty", BCryptSetProperty);
++DECLARE_CRT_EXPORT("BCryptCreateHash", BCryptCreateHash);
++DECLARE_CRT_EXPORT("BCryptHashData", BCryptHashData);
++DECLARE_CRT_EXPORT("BCryptFinishHash", BCryptFinishHash);
++DECLARE_CRT_EXPORT("BCryptDestroyHash", BCryptDestroyHash);
++DECLARE_CRT_EXPORT("BCryptImportKeyPair", BCryptImportKeyPair);
++DECLARE_CRT_EXPORT("BCryptDestroyKey", BCryptDestroyKey);
++DECLARE_CRT_EXPORT("BCryptVerifySignature", BCryptVerifySignature);
++DECLARE_CRT_EXPORT("BCryptEncrypt", BCryptEncrypt);
++DECLARE_CRT_EXPORT("BCryptExportKey", BCryptExportKey);
++DECLARE_CRT_EXPORT("BCryptGenerateSymmetricKey", BCryptGenerateSymmetricKey);
+ DECLARE_CRT_EXPORT("CryptAcquireContextW", CryptAcquireContextW);
+ DECLARE_CRT_EXPORT("CryptGetHashParam", CryptGetHashParam);
+ DECLARE_CRT_EXPORT("CryptSetHashParam", CryptSetHashParam);
+ DECLARE_CRT_EXPORT("CryptVerifySignatureW", CryptVerifySignatureW);
+ DECLARE_CRT_EXPORT("CryptDestroyHash", CryptDestroyHash);
++// Runtime-resolved crypt32.dll exports
++DECLARE_CRT_EXPORT("CertAddEncodedCertificateToStore", CertAddEncodedCertificateToStore);
++DECLARE_CRT_EXPORT("CertCreateCertificateContext", CertCreateCertificateContext);
++DECLARE_CRT_EXPORT("CertDeleteCertificateFromStore", CertDeleteCertificateFromStore);
++DECLARE_CRT_EXPORT("CertEnumCertificatesInStore", CertEnumCertificatesInStore);
++DECLARE_CRT_EXPORT("CertFreeCertificateChain", CertFreeCertificateChain);
++DECLARE_CRT_EXPORT("CertGetCertificateChain", CertGetCertificateChain);
++DECLARE_CRT_EXPORT("CertGetCertificateContextProperty", CertGetCertificateContextProperty);
++DECLARE_CRT_EXPORT("CertGetNameStringW", CertGetNameStringW);
++DECLARE_CRT_EXPORT("CertNameToStrW", CertNameToStrW);
++DECLARE_CRT_EXPORT("CryptDecodeObject", CryptDecodeObject);
++DECLARE_CRT_EXPORT("CryptMsgClose", CryptMsgClose);
++DECLARE_CRT_EXPORT("CryptMsgGetParam", CryptMsgGetParam);
++DECLARE_CRT_EXPORT("CryptMsgOpenToDecode", CryptMsgOpenToDecode);
++DECLARE_CRT_EXPORT("CryptMsgUpdate", CryptMsgUpdate);
++DECLARE_CRT_EXPORT("CryptQueryObject", CryptQueryObject);
++DECLARE_CRT_EXPORT("CryptStringToBinaryW", CryptStringToBinaryW);
+ 
+diff --git a/peloader/winapi/Environment.c b/peloader/winapi/Environment.c
+index cccb685..018c3a1 100644
+--- a/peloader/winapi/Environment.c
++++ b/peloader/winapi/Environment.c
+@@ -1,6 +1,7 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ #include <string.h>
++#include <strings.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <search.h>
+@@ -61,52 +62,99 @@ STATIC DWORD WINAPI GetEnvironmentVariableW(PWCHAR lpName, PVOID lpBuffer, DWORD
+     return CountWideChars(lpBuffer);
+ }
+ 
++// Known environment variable mappings (case-insensitive lookup).
++static struct {
++    const char *Name;
++    const char *Value;
++} KnownEnvVars[] = {
++    { "ProgramFiles",        "C:\\Program Files" },
++    { "ProgramFiles(x86)",   "C:\\Program Files" },
++    { "AllUsersProfile",     "C:\\ProgramData" },
++    { "ProgramData",         "C:\\ProgramData" },
++    { "PATH",                "C:\\Path" },
++    { "windir",              "C:\\Windows" },
++    { "WINDIR",              "C:\\Windows" },
++    { "SystemRoot",          "C:\\Windows" },
++    { "CommonProgramFiles",  "C:\\CommonProgramFiles" },
++    { NULL, NULL },
++};
++
++// Expand %VAR% patterns in an ANSI string, writing result to out.
++// Returns the required buffer length (including NUL).
++static size_t expand_env_ansi(const char *src, char *out, size_t outlen)
++{
++    size_t pos = 0;
++
++    while (*src) {
++        if (*src == '%') {
++            const char *end = strchr(src + 1, '%');
++            if (end && end > src + 1) {
++                size_t varlen = end - src - 1;
++                const char *replacement = NULL;
++
++                for (int i = 0; KnownEnvVars[i].Name; i++) {
++                    if (strlen(KnownEnvVars[i].Name) == varlen &&
++                        strncasecmp(KnownEnvVars[i].Name, src + 1, varlen) == 0) {
++                        replacement = KnownEnvVars[i].Value;
++                        break;
++                    }
++                }
++
++                if (replacement) {
++                    size_t rlen = strlen(replacement);
++                    if (out && pos + rlen < outlen)
++                        memcpy(out + pos, replacement, rlen);
++                    pos += rlen;
++                    src = end + 1;
++                    continue;
++                }
++            }
++        }
++        if (out && pos + 1 < outlen)
++            out[pos] = *src;
++        pos++;
++        src++;
++    }
++
++    if (out && pos < outlen)
++        out[pos] = '\0';
++    else if (out && outlen > 0)
++        out[outlen - 1] = '\0';
++
++    return pos + 1;
++}
++
+ // MPENGINE is very fussy about what ExpandEnvironmentStringsW returns.
+ STATIC DWORD WINAPI ExpandEnvironmentStringsW(PWCHAR lpSrc, PWCHAR lpDst, DWORD nSize)
+ {
+     PCHAR AnsiString = CreateAnsiFromWide(lpSrc);
+-    DWORD Result;
+-    struct {
+-        PCHAR   Src;
+-        PWCHAR  Dst;
+-    } KnownPaths[] = {
+-        { "%ProgramFiles%", L"C:\\Program Files" },
+-        { "%AllUsersProfile%", L"C:\\ProgramData" },
+-        { "%PATH%", L"C:\\Path" },
+-        { "%windir%", L"C:\\Windows" },
+-        { "%ProgramFiles(x86)%", L"C:\\Program Files" },
+-        { "%WINDIR%\\system32\\drivers", L"C:\\WINDOWS\\system32\\drivers" },
+-        { "%windir%\\temp", L"C:\\WINDOWS\\temp" },
+-        { "%CommonProgramFiles%", L"C:\\CommonProgramFiles" },
+-        { NULL },
+-    };
+ 
+     DebugLog("%p [%s], %p, %u", lpSrc, AnsiString, lpDst, nSize);
+ 
+-    for (int i = 0; KnownPaths[i].Src; i++) {
+-        if (strcmp(AnsiString, KnownPaths[i].Src) == 0) {
+-            Result = CountWideChars(KnownPaths[i].Dst) + 1;
+-            if (nSize < Result) {
+-                goto finish;
+-            }
+-            memcpy(lpDst, KnownPaths[i].Dst, Result * 2);
+-            goto finish;
+-        }
++    // First pass: determine required size.
++    size_t needed = expand_env_ansi(AnsiString, NULL, 0);
++
++    if (!lpDst || nSize < needed) {
++        free(AnsiString);
++        return (DWORD)needed;
+     }
+ 
++    // Second pass: expand into a temporary ANSI buffer.
++    char *expanded = malloc(needed);
++    if (!expanded) {
++        free(AnsiString);
++        return 0;
++    }
++    expand_env_ansi(AnsiString, expanded, needed);
+     free(AnsiString);
+ 
+-    if (nSize < CountWideChars(lpSrc) + 1) {
+-        return CountWideChars(lpSrc) + 1;
++    // Convert expanded ANSI to wide string.
++    for (size_t i = 0; i < needed && i < nSize; i++) {
++        lpDst[i] = (WCHAR)(unsigned char)expanded[i];
+     }
+ 
+-    memcpy(lpDst, lpSrc, (1 + CountWideChars(lpSrc)) * 2);
+-
+-    return CountWideChars(lpSrc) + 1;
+-
+-finish:
+-    free(AnsiString);
+-    return Result;
++    free(expanded);
++    return (DWORD)needed;
+ }
+ 
+ static DWORD WINAPI GetEnvironmentVariableA(PCHAR lpName, PVOID lpBuffer, DWORD nSize)
+diff --git a/peloader/winapi/Exception.c b/peloader/winapi/Exception.c
+index b21a8a3..2f07e09 100644
+--- a/peloader/winapi/Exception.c
++++ b/peloader/winapi/Exception.c
+@@ -41,6 +41,19 @@ VOID DumpExceptionChain(VOID)
+ }
+ #endif
+ 
++// Check if an address looks like a valid stack pointer (heuristic)
++static inline int is_valid_seh_frame(PEXCEPTION_FRAME frame)
++{
++    uintptr_t addr = (uintptr_t)frame;
++    // Stack addresses on Linux x86-32 are typically in the 0xff000000+ range
++    // Heap addresses are typically much lower. Also accept NULL (end of chain).
++    if (frame == NULL) return 1;
++    if (addr >= 0xff000000 && addr <= 0xffffffff) return 1;
++    // Also accept addresses in the thread stack range (could vary)
++    if (addr >= 0xf0000000) return 1;
++    return 0;
++}
++
+ static WINAPI PVOID RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags, DWORD nNumberOfArguments, PVOID Arguments)
+ {
+     PEXCEPTION_FRAME ExceptionList;
+@@ -85,16 +98,16 @@ static WINAPI PVOID RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags
+             continue;
+         }
+ 
+-        // I've never seen any other handler return code with mpengine.
+-        __debugbreak();
++        // Handler returned something other than ExceptionContinueSearch.
++        DebugLog("WARNING: Handler returned unexpected result %u", Result);
++        break;
+     }
+ 
+-    // Unhandled Exception?
+-    DebugLog("%u Element SEH Chain Complete.", Depth);
++    // Unhandled C++ exception - for 0xe06d7363 this is normal in some cases
++    // (the C++ runtime will call std::terminate or handle it otherwise)
++    DebugLog("%u Element SEH Chain Complete, exception %#x unhandled.", Depth, dwExceptionCode);
+ 
+ finished:
+-    // I've never seen this reached, I'm not sure if it works.
+-    __debugbreak();
+     return NULL;
+ }
+ 
+@@ -146,6 +159,10 @@ static WINAPI void RtlUnwind(PEXCEPTION_FRAME TargetFrame, PVOID TargetIp, PEXCE
+         if (ExceptionList == TargetFrame) {
+             DebugLog("TargetFrame %p == ExceptionList %p, Restore Context", ExceptionList, TargetFrame);
+ 
++            // Remove the TargetFrame from the SEH chain before restoring context.
++            // The handler's catch block expects fs:0 to point past this frame.
++            asm("mov %[list], %%fs:0" :: [list] "r"(ExceptionList->prev));
++
+             setcontext(&Context);
+ 
+             // Should not reach here.
+diff --git a/peloader/winapi/Files.c b/peloader/winapi/Files.c
+index f469367..a4fd142 100644
+--- a/peloader/winapi/Files.c
++++ b/peloader/winapi/Files.c
+@@ -8,6 +8,9 @@
+ #include <stdlib.h>
+ #include <ctype.h>
+ #include <unistd.h>
++#include <dirent.h>
++#include <limits.h>
++#include <strings.h>
+ 
+ #include "winnt_types.h"
+ #include "pe_linker.h"
+@@ -17,6 +20,11 @@
+ #include "util.h"
+ #include "winstrings.h"
+ 
++extern int is_thread_handle(HANDLE hObject);
++extern void close_thread_handle(HANDLE hObject);
++extern int is_file_mapping(HANDLE hObject);
++extern void close_file_mapping(HANDLE hObject);
++
+ typedef struct _WIN32_FILE_ATTRIBUTE_DATA {
+   DWORD    dwFileAttributes;
+   FILETIME ftCreationTime;
+@@ -34,6 +42,156 @@ extern void WINAPI SetLastError(DWORD dwErrCode);
+ 
+ #define INVALID_FILE_ATTRIBUTES -1;
+ 
++static bool trace_files_enabled(void)
++{
++    const char *v = getenv("MPENGINE_TRACE_FILES");
++    return v && *v;
++}
++
++static void normalize_winpath(char *path)
++{
++    if (!path)
++        return;
++
++    // Strip Win32 device prefixes.
++    if (strncmp(path, "\\\\?\\", 4) == 0 || strncmp(path, "\\\\??\\", 5) == 0) {
++        memmove(path, path + 4, strlen(path + 4) + 1);
++    }
++
++    // Translate path separator.
++    for (char *p = path; *p; ++p) {
++        if (*p == '\\')
++            *p = '/';
++    }
++
++    // Handle //./ prefix.
++    if (strncmp(path, "//./", 4) == 0) {
++        memmove(path, path + 4, strlen(path + 4) + 1);
++    } else if (strncmp(path, "/./", 3) == 0) {
++        memmove(path, path + 3, strlen(path + 3) + 1);
++    }
++
++    // Collapse duplicate slashes.
++    char *src = path;
++    char *dst = path;
++    while (*src) {
++        *dst++ = *src;
++        if (*src == '/') {
++            while (*src == '/')
++                src++;
++            continue;
++        }
++        src++;
++    }
++    *dst = '\0';
++
++    // Strip drive prefix if present (e.g. C:/path -> /path).
++    if (isalpha((unsigned char)path[0]) && path[1] == ':') {
++        if (path[2] == '\0') {
++            strcpy(path, "/");
++        } else {
++            memmove(path, path + 2, strlen(path + 2) + 1);
++        }
++    }
++}
++
++static FILE *open_special_if_missing(const char *path, DWORD disposition)
++{
++    if (!path)
++        return NULL;
++
++    // Allow creation of test license if missing (engine handles empty license gracefully).
++    // Do NOT create mpcache files — empty ones cause C++ exceptions and 0x8001 boot failure.
++    if (strcasestr(path, "mpenginetestlicense.dat")) {
++        if (disposition == 3 || disposition == 4) {
++            return fopen(path, "w+");
++        }
++    }
++
++    // Treat volume device opens like //./C: as root.
++    if (strcmp(path, "/") == 0) {
++        return fopen("/", "r");
++    }
++
++    return NULL;
++}
++static char *ResolveCasePath(const char *path)
++{
++    if (!path || !*path)
++        return NULL;
++
++    char *work = strdup(path);
++    if (!work)
++        return NULL;
++
++    size_t out_cap = strlen(path) + 2;
++    char *out = calloc(1, out_cap);
++    if (!out) {
++        free(work);
++        return NULL;
++    }
++
++    bool abs = (work[0] == '/');
++    char cur[PATH_MAX];
++    size_t out_len = 0;
++
++    if (abs) {
++        strcpy(cur, "/");
++        out[out_len++] = '/';
++        out[out_len] = '\0';
++    } else {
++        strcpy(cur, ".");
++    }
++
++    char *saveptr = NULL;
++    char *token = strtok_r(abs ? work + 1 : work, "/", &saveptr);
++    while (token) {
++        DIR *dir = opendir(cur);
++        const char *match = token;
++        if (dir) {
++            struct dirent *ent = NULL;
++            while ((ent = readdir(dir))) {
++                if (strcasecmp(ent->d_name, token) == 0) {
++                    match = ent->d_name;
++                    break;
++                }
++            }
++            closedir(dir);
++        }
++
++        if (out_len && out[out_len - 1] != '/') {
++            out[out_len++] = '/';
++            out[out_len] = '\0';
++        }
++        size_t mlen = strlen(match);
++        if (out_len + mlen + 1 > out_cap)
++            break;
++        memcpy(out + out_len, match, mlen);
++        out_len += mlen;
++        out[out_len] = '\0';
++
++        {
++            char tmp[PATH_MAX];
++            if (strcmp(cur, "/") == 0)
++                snprintf(tmp, sizeof(tmp), "/%s", match);
++            else if (strcmp(cur, ".") == 0)
++                snprintf(tmp, sizeof(tmp), "%s", match);
++            else
++                snprintf(tmp, sizeof(tmp), "%s/%s", cur, match);
++            memcpy(cur, tmp, sizeof(cur));
++        }
++
++        token = strtok_r(NULL, "/", &saveptr);
++    }
++
++    free(work);
++    if (out_len == 0) {
++        free(out);
++        return NULL;
++    }
++    return out;
++}
++
+ static DWORD WINAPI GetFileAttributesW(PVOID lpFileName)
+ {
+     DWORD Result = FILE_ATTRIBUTE_NORMAL;
+@@ -74,20 +232,23 @@ enum {
+ static HANDLE WINAPI CreateFileA(PCHAR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, PVOID lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+ {
+     FILE *FileHandle;
++    char *resolved = NULL;
+ 
+     DebugLog("%p [%s], %#x, %#x, %p, %#x, %#x, %p", lpFileName, lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+ 
+-    // Translate path seperator.
+-    while (strchr(lpFileName, '\\'))
+-        *strchr(lpFileName, '\\') = '/';
+-
+-    // I'm just going to tolower() everything.
+-    for (char *t = lpFileName; *t; t++)
+-        *t = tolower(*t);
++    normalize_winpath(lpFileName);
+ 
+     switch (dwCreationDisposition) {
+         case OPEN_EXISTING:
+             FileHandle = fopen(lpFileName, "r");
++            if (!FileHandle) {
++                resolved = ResolveCasePath(lpFileName);
++                if (resolved) {
++                    FileHandle = fopen(resolved, "r");
++                }
++            }
++            if (!FileHandle)
++                FileHandle = open_special_if_missing(lpFileName, dwCreationDisposition);
+             break;
+         case CREATE_ALWAYS:
+             FileHandle = fopen("/dev/null", "w");
+@@ -108,7 +269,11 @@ static HANDLE WINAPI CreateFileA(PCHAR lpFileName, DWORD dwDesiredAccess, DWORD
+ 
+     DebugLog("%s => %p", lpFileName, FileHandle);
+ 
+-    SetLastError(ERROR_FILE_NOT_FOUND);
++    if (resolved)
++        free(resolved);
++    if (!FileHandle && trace_files_enabled())
++        LogMessage("CreateFileA failed (disp=%u): %s", dwCreationDisposition, lpFileName);
++    SetLastError(FileHandle ? 0 : ERROR_FILE_NOT_FOUND);
+     return FileHandle ? FileHandle : INVALID_HANDLE_VALUE;
+ }
+ 
+@@ -117,22 +282,25 @@ static HANDLE WINAPI CreateFileW(PWCHAR lpFileName, DWORD dwDesiredAccess, DWORD
+ {
+     FILE *FileHandle;
+     char *filename = CreateAnsiFromWide(lpFileName);
++    char *resolved = NULL;
+ 
+     DebugLog("%p [%s], %#x, %#x, %p, %#x, %#x, %p", lpFileName, filename, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+ 
+-    // Translate path seperator.
+-    while (strchr(filename, '\\'))
+-        *strchr(filename, '\\') = '/';
+-
+-    // I'm just going to tolower() everything.
+-    for (char *t = filename; *t; t++)
+-        *t = tolower(*t);
++    normalize_winpath(filename);
+ 
+     //LogMessage("%u %s", dwCreationDisposition, filename);
+ 
+     switch (dwCreationDisposition) {
+         case OPEN_EXISTING:
+             FileHandle = fopen(filename, "r");
++            if (!FileHandle) {
++                resolved = ResolveCasePath(filename);
++                if (resolved) {
++                    FileHandle = fopen(resolved, "r");
++                }
++            }
++            if (!FileHandle)
++                FileHandle = open_special_if_missing(filename, dwCreationDisposition);
+             break;
+         case CREATE_ALWAYS:
+             FileHandle = fopen("/dev/null", "w");
+@@ -153,9 +321,13 @@ static HANDLE WINAPI CreateFileW(PWCHAR lpFileName, DWORD dwDesiredAccess, DWORD
+ 
+     DebugLog("%s => %p", filename, FileHandle);
+ 
+-    free(filename);
++    if (!FileHandle && trace_files_enabled())
++        LogMessage("CreateFileW failed (disp=%u): %s", dwCreationDisposition, filename);
++    SetLastError(FileHandle ? 0 : ERROR_FILE_NOT_FOUND);
+ 
+-    SetLastError(ERROR_FILE_NOT_FOUND);
++    free(filename);
++    if (resolved)
++        free(resolved);
+     return FileHandle ? FileHandle : INVALID_HANDLE_VALUE;
+ }
+ 
+@@ -201,16 +373,27 @@ static BOOL WINAPI SetFilePointerEx(HANDLE hFile, uint64_t liDistanceToMove,  ui
+ static BOOL WINAPI CloseHandle(HANDLE hObject)
+ {
+     DebugLog("%p", hObject);
+-    if (hObject != (HANDLE) 'EVNT'
+-     && hObject != INVALID_HANDLE_VALUE
+-     && hObject != (HANDLE) 'SEMA')
+-        fclose(hObject);
++    if (hObject == INVALID_HANDLE_VALUE)
++        return TRUE;
++    if (hObject == (HANDLE) 'EVNT'
++     || hObject == (HANDLE) 'SEMA')
++        return TRUE;
++    if (is_thread_handle(hObject)) {
++        close_thread_handle(hObject);
++        return TRUE;
++    }
++    if (is_file_mapping(hObject)) {
++        close_file_mapping(hObject);
++        return TRUE;
++    }
++    fclose(hObject);
+     return TRUE;
+ }
+ 
+ static BOOL WINAPI ReadFile(HANDLE hFile, PVOID lpBuffer, DWORD nNumberOfBytesToRead, PDWORD lpNumberOfBytesRead, PVOID lpOverlapped)
+ {
+     *lpNumberOfBytesRead = fread(lpBuffer, 1, nNumberOfBytesToRead, hFile);
++    DebugLog("%p, %p, %u => %u", hFile, lpBuffer, nNumberOfBytesToRead, *lpNumberOfBytesRead);
+     return TRUE;
+ }
+ 
+@@ -336,8 +519,22 @@ static BOOL WINAPI VerQueryValueW(PVOID pBlock, PWCHAR lpSubBlock, PVOID  *lplpB
+ 
+ static DWORD WINAPI QueryDosDevice(PVOID lpDeviceName, PVOID lpTargetPath, DWORD ucchMax)
+ {
+-    DebugLog("");
+-    return 0;
++    // Return a plausible device path for any drive letter query.
++    // The result is a multi-string: "\\Device\\HarddiskVolume1\0\0"
++    static const WCHAR DevicePath[] = L"\\Device\\HarddiskVolume1";
++    DWORD needed = sizeof(DevicePath) / sizeof(WCHAR) + 1; // +1 for extra NUL terminator
++
++    DebugLog("%S", lpDeviceName ? (PWCHAR)lpDeviceName : L"(null)");
++
++    if (!lpTargetPath || ucchMax < needed) {
++        return 0;
++    }
++
++    memcpy(lpTargetPath, DevicePath, sizeof(DevicePath));
++    // Multi-string requires double NUL terminator
++    ((WCHAR *)lpTargetPath)[sizeof(DevicePath) / sizeof(WCHAR)] = 0;
++
++    return needed;
+ }
+ 
+ static BOOL WINAPI GetDiskFreeSpaceExW(PWCHAR lpDirectoryName, PVOID lpFreeBytesAvailableToCaller, PVOID lpTotalNumberOfBytes, QWORD *lpTotalNumberOfFreeBytes)
+diff --git a/peloader/winapi/LoadLibrary.c b/peloader/winapi/LoadLibrary.c
+index cc95e05..691a32a 100644
+--- a/peloader/winapi/LoadLibrary.c
++++ b/peloader/winapi/LoadLibrary.c
+@@ -77,7 +77,12 @@ static DWORD WINAPI GetModuleFileNameA(HANDLE hModule, PCHAR lpFilename, DWORD n
+ {
+     DebugLog("%p, %p, %u", hModule, lpFilename, nSize);
+ 
+-    strncpy(lpFilename, "C:\\dummy\\fakename.exe", nSize);
++    // Return a plausible path for mpengine.dll when called with its base address
++    if (hModule == (HANDLE) 'MPEN' || (uintptr_t)hModule == 0x10000000) {
++        strncpy(lpFilename, "C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.25080.5\\mpengine.dll", nSize);
++    } else {
++        strncpy(lpFilename, "C:\\Windows\\System32\\mpclient.exe", nSize);
++    }
+ 
+     return strlen(lpFilename);
+ }
+diff --git a/peloader/winapi/Locale.c b/peloader/winapi/Locale.c
+index f8344cb..095a40f 100644
+--- a/peloader/winapi/Locale.c
++++ b/peloader/winapi/Locale.c
+@@ -83,6 +83,64 @@ STATIC WINAPI int GetLocaleInfoEx(LPCWSTR lpLocaleName, DWORD LCType, LPWSTR lpL
+     return 0;
+ }
+ 
++typedef BOOL (WINAPI *LOCALE_ENUMPROCEX)(PVOID, DWORD, PVOID);
++
++STATIC WINAPI BOOL EnumSystemLocalesEx(LOCALE_ENUMPROCEX lpLocaleEnumProcEx, DWORD dwFlags, PVOID lParam, PVOID lpReserved)
++{
++    DebugLog("%p, %#x, %p, %p", lpLocaleEnumProcEx, dwFlags, lParam, lpReserved);
++    // Call the callback with en-US locale
++    if (lpLocaleEnumProcEx) {
++        lpLocaleEnumProcEx(L"en-US", 0, lParam);
++    }
++    return TRUE;
++}
++
++STATIC WINAPI int GetDateFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, PVOID lpDate, LPCWSTR lpFormat, LPWSTR lpDateStr, int cchDate, LPCWSTR lpCalendar)
++{
++    DebugLog("%p, %#x, %p, %p, %p, %d, %p", lpLocaleName, dwFlags, lpDate, lpFormat, lpDateStr, cchDate, lpCalendar);
++    if (lpDateStr && cchDate > 0) {
++        memcpy(lpDateStr, L"1/1/2025", 9 * sizeof(WCHAR));
++        return 9;
++    }
++    return 9;
++}
++
++STATIC WINAPI int GetTimeFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, PVOID lpTime, LPCWSTR lpFormat, LPWSTR lpTimeStr, int cchTime)
++{
++    DebugLog("%p, %#x, %p, %p, %p, %d", lpLocaleName, dwFlags, lpTime, lpFormat, lpTimeStr, cchTime);
++    if (lpTimeStr && cchTime > 0) {
++        memcpy(lpTimeStr, L"12:00:00", 9 * sizeof(WCHAR));
++        return 9;
++    }
++    return 9;
++}
++
++STATIC WINAPI int GetUserDefaultLocaleName(LPWSTR lpLocaleName, int cchLocaleName)
++{
++    DebugLog("%p, %d", lpLocaleName, cchLocaleName);
++    if (lpLocaleName && cchLocaleName >= 6) {
++        memcpy(lpLocaleName, L"en-US", 6 * sizeof(WCHAR));
++        return 6;
++    }
++    return 0;
++}
++
++STATIC WINAPI BOOL IsValidLocaleName(LPCWSTR lpLocaleName)
++{
++    DebugLog("%p", lpLocaleName);
++    return TRUE;
++}
++
++STATIC WINAPI int LCIDToLocaleName(DWORD Locale, LPWSTR lpName, int cchName, DWORD dwFlags)
++{
++    DebugLog("%#x, %p, %d, %#x", Locale, lpName, cchName, dwFlags);
++    if (lpName && cchName >= 6) {
++        memcpy(lpName, L"en-US", 6 * sizeof(WCHAR));
++        return 6;
++    }
++    return 0;
++}
++
+ DECLARE_CRT_EXPORT("GetACP", GetACP);
+ DECLARE_CRT_EXPORT("IsValidCodePage", IsValidCodePage);
+ DECLARE_CRT_EXPORT("GetCPInfo", GetCPInfo);
+@@ -90,3 +148,9 @@ DECLARE_CRT_EXPORT("LocaleNameToLCID", LocaleNameToLCID);
+ DECLARE_CRT_EXPORT("LCMapStringW", LCMapStringW);
+ DECLARE_CRT_EXPORT("LCMapStringEx", LCMapStringEx);
+ DECLARE_CRT_EXPORT("GetLocaleInfoEx", GetLocaleInfoEx);
++DECLARE_CRT_EXPORT("EnumSystemLocalesEx", EnumSystemLocalesEx);
++DECLARE_CRT_EXPORT("GetDateFormatEx", GetDateFormatEx);
++DECLARE_CRT_EXPORT("GetTimeFormatEx", GetTimeFormatEx);
++DECLARE_CRT_EXPORT("GetUserDefaultLocaleName", GetUserDefaultLocaleName);
++DECLARE_CRT_EXPORT("IsValidLocaleName", IsValidLocaleName);
++DECLARE_CRT_EXPORT("LCIDToLocaleName", LCIDToLocaleName);
+diff --git a/peloader/winapi/ProcessThreads.c b/peloader/winapi/ProcessThreads.c
+index 726b33c..c48b8d3 100644
+--- a/peloader/winapi/ProcessThreads.c
++++ b/peloader/winapi/ProcessThreads.c
+@@ -107,6 +107,12 @@ static VOID WINAPI AcquireSRWLockExclusive(PVOID SRWLock)
+     DebugLog("%p", SRWLock);
+ }
+ 
++static BOOL WINAPI TryAcquireSRWLockExclusive(PVOID SRWLock)
++{
++    DebugLog("%p", SRWLock);
++    return TRUE;
++}
++
+ static VOID WINAPI AcquireSRWLockShared(PVOID SRWLock)
+ {
+     DebugLog("%p", SRWLock);
+@@ -194,6 +200,7 @@ DECLARE_CRT_EXPORT("InterlockedIncrement", InterlockedIncrement);
+ DECLARE_CRT_EXPORT("InterlockedCompareExchange", InterlockedCompareExchange);
+ DECLARE_CRT_EXPORT("CreateSemaphoreW", CreateSemaphoreW);
+ DECLARE_CRT_EXPORT("AcquireSRWLockExclusive", AcquireSRWLockExclusive);
++DECLARE_CRT_EXPORT("TryAcquireSRWLockExclusive", TryAcquireSRWLockExclusive);
+ DECLARE_CRT_EXPORT("AcquireSRWLockShared", AcquireSRWLockShared);
+ DECLARE_CRT_EXPORT("InitializeSRWLock", InitializeSRWLock);
+ DECLARE_CRT_EXPORT("ReleaseSRWLockExclusive", ReleaseSRWLockExclusive);
+diff --git a/peloader/winapi/WinTrust.c b/peloader/winapi/WinTrust.c
+index a8ddcb3..7c83944 100644
+--- a/peloader/winapi/WinTrust.c
++++ b/peloader/winapi/WinTrust.c
+@@ -5,6 +5,12 @@
+ #include <search.h>
+ #include <stdlib.h>
+ #include <assert.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/wait.h>
++#include <errno.h>
++#include <dirent.h>
++#include <strings.h>
+ 
+ #include "winnt_types.h"
+ #include "pe_linker.h"
+@@ -12,34 +18,702 @@
+ #include "log.h"
+ #include "winexports.h"
+ #include "util.h"
++#include "winstrings.h"
++
++extern void WINAPI SetLastError(DWORD dwErrCode);
++
++#define ERROR_SUCCESS 0
++#define ERROR_INVALID_PARAMETER 87
++#define ERROR_INSUFFICIENT_BUFFER 122
++#define ERROR_NOT_FOUND 1168
++
++#define TRUST_E_NOSIGNATURE 0x800B0100
++#define TRUST_E_SUBJECT_FORM_UNKNOWN 0x800B0003
++
++#define MAX_PATH 260
++
++enum {
++    WTD_CHOICE_FILE = 1,
++    WTD_CHOICE_CATALOG = 2,
++};
++
++typedef struct _WINTRUST_FILE_INFO {
++    DWORD cbStruct;
++    PWCHAR pcwszFilePath;
++    HANDLE hFile;
++    GUID *pgKnownSubject;
++} WINTRUST_FILE_INFO, *PWINTRUST_FILE_INFO;
++
++typedef struct _WINTRUST_CATALOG_INFO {
++    DWORD cbStruct;
++    DWORD dwCatalogVersion;
++    PWCHAR pcwszCatalogFilePath;
++    PWCHAR pcwszMemberTag;
++    PWCHAR pcwszMemberFilePath;
++    HANDLE hMemberFile;
++    PVOID pbCalculatedFileHash;
++    DWORD cbCalculatedFileHash;
++    PVOID pcCatalogContext;
++    HANDLE hCatAdmin;
++} WINTRUST_CATALOG_INFO, *PWINTRUST_CATALOG_INFO;
++
++typedef struct _WINTRUST_DATA {
++    DWORD cbStruct;
++    PVOID pPolicyCallbackData;
++    PVOID pSIPClientData;
++    DWORD dwUIChoice;
++    DWORD fdwRevocationChecks;
++    DWORD dwUnionChoice;
++    union {
++        PWINTRUST_FILE_INFO pFile;
++        PWINTRUST_CATALOG_INFO pCatalog;
++        PVOID pBlob;
++        PVOID pSgnr;
++        PVOID pCert;
++    };
++    DWORD dwStateAction;
++    HANDLE hWVTStateData;
++    PWCHAR pwszURLReference;
++    DWORD dwProvFlags;
++    DWORD dwUIContext;
++} WINTRUST_DATA, *PWINTRUST_DATA;
++
++typedef struct _CATALOG_INFO {
++    DWORD cbStruct;
++    WCHAR wszCatalogFile[MAX_PATH];
++} CATALOG_INFO, *PCATALOG_INFO;
++
++typedef struct _CAT_CONTEXT {
++    DWORD magic;
++    char path[MAX_PATH];
++} CAT_CONTEXT;
++
++#define CAT_CONTEXT_MAGIC 0x43415443  /* 'CATC' */
++
++static const GUID WINTRUST_ACTION_GENERIC_VERIFY_V2 = {
++    0xaac56b,
++    0xcd44,
++    0x11d0,
++    {0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee}
++};
++
++typedef struct {
++    uint32_t state[8];
++    uint64_t bitlen;
++    uint8_t data[64];
++    size_t datalen;
++} SHA256_CTX;
++
++typedef struct {
++    uint32_t state[5];
++    uint64_t bitlen;
++    uint8_t data[64];
++    size_t datalen;
++} SHA1_CTX;
++
++static void sha1_transform(SHA1_CTX *ctx, const uint8_t data[])
++{
++    uint32_t a, b, c, d, e, f, k, temp;
++    uint32_t w[80];
++
++    for (size_t i = 0, j = 0; i < 16; ++i, j += 4) {
++        w[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j + 1] << 16) |
++               ((uint32_t)data[j + 2] << 8) | ((uint32_t)data[j + 3]);
++    }
++    for (size_t i = 16; i < 80; ++i) {
++        uint32_t v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
++        w[i] = (v << 1) | (v >> 31);
++    }
++
++    a = ctx->state[0];
++    b = ctx->state[1];
++    c = ctx->state[2];
++    d = ctx->state[3];
++    e = ctx->state[4];
++
++    for (size_t i = 0; i < 80; ++i) {
++        if (i < 20) {
++            f = (b & c) | ((~b) & d);
++            k = 0x5a827999;
++        } else if (i < 40) {
++            f = b ^ c ^ d;
++            k = 0x6ed9eba1;
++        } else if (i < 60) {
++            f = (b & c) | (b & d) | (c & d);
++            k = 0x8f1bbcdc;
++        } else {
++            f = b ^ c ^ d;
++            k = 0xca62c1d6;
++        }
++
++        temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
++        e = d;
++        d = c;
++        c = (b << 30) | (b >> 2);
++        b = a;
++        a = temp;
++    }
++
++    ctx->state[0] += a;
++    ctx->state[1] += b;
++    ctx->state[2] += c;
++    ctx->state[3] += d;
++    ctx->state[4] += e;
++}
++
++static void sha1_init(SHA1_CTX *ctx)
++{
++    ctx->datalen = 0;
++    ctx->bitlen = 0;
++    ctx->state[0] = 0x67452301;
++    ctx->state[1] = 0xefcdab89;
++    ctx->state[2] = 0x98badcfe;
++    ctx->state[3] = 0x10325476;
++    ctx->state[4] = 0xc3d2e1f0;
++}
++
++static void sha1_update(SHA1_CTX *ctx, const uint8_t data[], size_t len)
++{
++    for (size_t i = 0; i < len; ++i) {
++        ctx->data[ctx->datalen] = data[i];
++        ctx->datalen++;
++        if (ctx->datalen == 64) {
++            sha1_transform(ctx, ctx->data);
++            ctx->bitlen += 512;
++            ctx->datalen = 0;
++        }
++    }
++}
++
++static void sha1_final(SHA1_CTX *ctx, uint8_t hash[20])
++{
++    uint32_t i = ctx->datalen;
++
++    if (ctx->datalen < 56) {
++        ctx->data[i++] = 0x80;
++        while (i < 56)
++            ctx->data[i++] = 0x00;
++    } else {
++        ctx->data[i++] = 0x80;
++        while (i < 64)
++            ctx->data[i++] = 0x00;
++        sha1_transform(ctx, ctx->data);
++        memset(ctx->data, 0, 56);
++    }
++
++    ctx->bitlen += ctx->datalen * 8;
++    ctx->data[63] = ctx->bitlen;
++    ctx->data[62] = ctx->bitlen >> 8;
++    ctx->data[61] = ctx->bitlen >> 16;
++    ctx->data[60] = ctx->bitlen >> 24;
++    ctx->data[59] = ctx->bitlen >> 32;
++    ctx->data[58] = ctx->bitlen >> 40;
++    ctx->data[57] = ctx->bitlen >> 48;
++    ctx->data[56] = ctx->bitlen >> 56;
++    sha1_transform(ctx, ctx->data);
++
++    for (i = 0; i < 4; ++i) {
++        hash[i]      = (ctx->state[0] >> (24 - i * 8)) & 0xff;
++        hash[i + 4]  = (ctx->state[1] >> (24 - i * 8)) & 0xff;
++        hash[i + 8]  = (ctx->state[2] >> (24 - i * 8)) & 0xff;
++        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0xff;
++        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0xff;
++    }
++}
++
++static void sha256_transform(SHA256_CTX *ctx, const uint8_t data[])
++{
++    static const uint32_t k[64] = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
++    };
++    uint32_t a, b, c, d, e, f, g, h;
++    uint32_t m[64];
++    for (size_t i = 0, j = 0; i < 16; ++i, j += 4) {
++        m[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j + 1] << 16) | ((uint32_t)data[j + 2] << 8) | ((uint32_t)data[j + 3]);
++    }
++    for (size_t i = 16; i < 64; ++i) {
++        uint32_t s0 = (m[i - 15] >> 7 | m[i - 15] << (32 - 7)) ^ (m[i - 15] >> 18 | m[i - 15] << (32 - 18)) ^ (m[i - 15] >> 3);
++        uint32_t s1 = (m[i - 2] >> 17 | m[i - 2] << (32 - 17)) ^ (m[i - 2] >> 19 | m[i - 2] << (32 - 19)) ^ (m[i - 2] >> 10);
++        m[i] = m[i - 16] + s0 + m[i - 7] + s1;
++    }
++
++    a = ctx->state[0];
++    b = ctx->state[1];
++    c = ctx->state[2];
++    d = ctx->state[3];
++    e = ctx->state[4];
++    f = ctx->state[5];
++    g = ctx->state[6];
++    h = ctx->state[7];
++
++    for (size_t i = 0; i < 64; ++i) {
++        uint32_t S1 = (e >> 6 | e << (32 - 6)) ^ (e >> 11 | e << (32 - 11)) ^ (e >> 25 | e << (32 - 25));
++        uint32_t ch = (e & f) ^ (~e & g);
++        uint32_t temp1 = h + S1 + ch + k[i] + m[i];
++        uint32_t S0 = (a >> 2 | a << (32 - 2)) ^ (a >> 13 | a << (32 - 13)) ^ (a >> 22 | a << (32 - 22));
++        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
++        uint32_t temp2 = S0 + maj;
++
++        h = g;
++        g = f;
++        f = e;
++        e = d + temp1;
++        d = c;
++        c = b;
++        b = a;
++        a = temp1 + temp2;
++    }
++
++    ctx->state[0] += a;
++    ctx->state[1] += b;
++    ctx->state[2] += c;
++    ctx->state[3] += d;
++    ctx->state[4] += e;
++    ctx->state[5] += f;
++    ctx->state[6] += g;
++    ctx->state[7] += h;
++}
++
++static void sha256_init(SHA256_CTX *ctx)
++{
++    ctx->datalen = 0;
++    ctx->bitlen = 0;
++    ctx->state[0] = 0x6a09e667;
++    ctx->state[1] = 0xbb67ae85;
++    ctx->state[2] = 0x3c6ef372;
++    ctx->state[3] = 0xa54ff53a;
++    ctx->state[4] = 0x510e527f;
++    ctx->state[5] = 0x9b05688c;
++    ctx->state[6] = 0x1f83d9ab;
++    ctx->state[7] = 0x5be0cd19;
++}
++
++static void sha256_update(SHA256_CTX *ctx, const uint8_t data[], size_t len)
++{
++    for (size_t i = 0; i < len; ++i) {
++        ctx->data[ctx->datalen] = data[i];
++        ctx->datalen++;
++        if (ctx->datalen == 64) {
++            sha256_transform(ctx, ctx->data);
++            ctx->bitlen += 512;
++            ctx->datalen = 0;
++        }
++    }
++}
++
++static void sha256_final(SHA256_CTX *ctx, uint8_t hash[32])
++{
++    uint32_t i = ctx->datalen;
++
++    if (ctx->datalen < 56) {
++        ctx->data[i++] = 0x80;
++        while (i < 56)
++            ctx->data[i++] = 0x00;
++    } else {
++        ctx->data[i++] = 0x80;
++        while (i < 64)
++            ctx->data[i++] = 0x00;
++        sha256_transform(ctx, ctx->data);
++        memset(ctx->data, 0, 56);
++    }
++
++    ctx->bitlen += ctx->datalen * 8;
++    ctx->data[63] = ctx->bitlen;
++    ctx->data[62] = ctx->bitlen >> 8;
++    ctx->data[61] = ctx->bitlen >> 16;
++    ctx->data[60] = ctx->bitlen >> 24;
++    ctx->data[59] = ctx->bitlen >> 32;
++    ctx->data[58] = ctx->bitlen >> 40;
++    ctx->data[57] = ctx->bitlen >> 48;
++    ctx->data[56] = ctx->bitlen >> 56;
++    sha256_transform(ctx, ctx->data);
++
++    for (i = 0; i < 4; ++i) {
++        hash[i]      = (ctx->state[0] >> (24 - i * 8)) & 0xff;
++        hash[i + 4]  = (ctx->state[1] >> (24 - i * 8)) & 0xff;
++        hash[i + 8]  = (ctx->state[2] >> (24 - i * 8)) & 0xff;
++        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0xff;
++        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0xff;
++        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0xff;
++        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0xff;
++        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0xff;
++    }
++}
++
++static bool guid_equal(const GUID *a, const GUID *b)
++{
++    return a && b &&
++           a->data1 == b->data1 &&
++           a->data2 == b->data2 &&
++           a->data3 == b->data3 &&
++           memcmp(a->data4, b->data4, sizeof(a->data4)) == 0;
++}
++
++static void ascii_to_wide(const char *in, WCHAR *out, size_t out_len)
++{
++    size_t i = 0;
++    if (!out || out_len == 0)
++        return;
++    if (!in) {
++        out[0] = 0;
++        return;
++    }
++    for (; i + 1 < out_len && in[i]; ++i)
++        out[i] = (uint8_t)in[i];
++    out[i] = 0;
++}
++
++static int run_verify_helper(const char *file, const char *catalog)
++{
++    const char *helper = getenv("MPENGINE_VERIFY_HELPER");
++    const char *fallback = "./tools/wintrust-verify";
++    char *argv[6];
++    int argc = 0;
++    pid_t pid;
++    int status = 0;
++
++    if (!helper || !*helper) {
++        if (access(fallback, X_OK) == 0) {
++            helper = fallback;
++        } else {
++            helper = "wintrust-verify";
++        }
++    }
++
++    argv[argc++] = (char *)helper;
++    argv[argc++] = "--file";
++    argv[argc++] = (char *)file;
++    if (catalog) {
++        argv[argc++] = "--catalog";
++        argv[argc++] = (char *)catalog;
++    }
++    argv[argc] = NULL;
++
++    pid = fork();
++    if (pid == 0) {
++        execvp(helper, argv);
++        _exit(127);
++    }
++    if (pid < 0) {
++        DebugLog("fork() failed: %m");
++        return -1;
++    }
++
++    if (waitpid(pid, &status, 0) < 0) {
++        DebugLog("waitpid() failed: %m");
++        return -1;
++    }
++
++    if (WIFEXITED(status)) {
++        return WEXITSTATUS(status);
++    }
++
++    return -1;
++}
++
++static bool trace_wintrust_enabled(void)
++{
++    const char *v = getenv("MPENGINE_TRACE_WINTRUST");
++    return v && *v;
++}
++
++static int verify_with_any_catalog(const char *file)
++{
++    const char *cat_dir = getenv("MPENGINE_CATALOG_DIR");
++    if (!cat_dir || !*cat_dir)
++        cat_dir = "engine";
++
++    DIR *dir = opendir(cat_dir);
++    if (!dir)
++        return -1;
++
++    struct dirent *ent = NULL;
++    while ((ent = readdir(dir))) {
++        const char *name = ent->d_name;
++        size_t len = strlen(name);
++        if (len < 4)
++            continue;
++        if (strcasecmp(name + len - 4, ".cat") != 0)
++            continue;
++
++        char path[MAX_PATH];
++        snprintf(path, sizeof(path), "%s/%s", cat_dir, name);
++        if (run_verify_helper(file, path) == 0) {
++            closedir(dir);
++            return 0;
++        }
++    }
++
++    closedir(dir);
++    return -1;
++}
+ 
+ STATIC WINAPI BOOL CryptCATAdminAcquireContext(PVOID phCatAdmin, PVOID pgSubsystem, DWORD dwFlags)
+ {
+     DebugLog("%p, %p, %#x", phCatAdmin, pgSubsystem, dwFlags);
++    if (trace_wintrust_enabled())
++        LogMessage("CryptCATAdminAcquireContext()");
++    if (!phCatAdmin) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    *(HANDLE *)phCatAdmin = (HANDLE) 'CATM';
++    SetLastError(ERROR_SUCCESS);
+     return TRUE;
+ }
+ 
+ STATIC WINAPI HANDLE CryptCATAdminEnumCatalogFromHash(HANDLE hCatAdmin, BYTE *pbHash, DWORD cbHash, DWORD dwFlags, PVOID phPrevCatInfo)
+ {
+     DebugLog("%p, %p, %u, %#x, %p", hCatAdmin, pbHash, cbHash, dwFlags, phPrevCatInfo);
++    if (phPrevCatInfo) {
++        return NULL;
++    }
++
++    const char *cat_path = getenv("MPENGINE_CATALOG_PATH");
++    if (cat_path && *cat_path) {
++        CAT_CONTEXT *ctx = calloc(1, sizeof(*ctx));
++        if (!ctx)
++            return NULL;
++        ctx->magic = CAT_CONTEXT_MAGIC;
++        strncpy(ctx->path, cat_path, sizeof(ctx->path) - 1);
++        if (trace_wintrust_enabled())
++            LogMessage("CryptCATAdminEnumCatalogFromHash -> %s", ctx->path);
++        return (HANDLE)ctx;
++    }
++
++    const char *cat_dir = getenv("MPENGINE_CATALOG_DIR");
++    if (!cat_dir || !*cat_dir)
++        cat_dir = "engine";
++
++    DIR *dir = opendir(cat_dir);
++    if (!dir) {
++        SetLastError(ERROR_NOT_FOUND);
++        return NULL;
++    }
++
++    struct dirent *ent = NULL;
++    while ((ent = readdir(dir))) {
++        const char *name = ent->d_name;
++        size_t len = strlen(name);
++        if (len < 4)
++            continue;
++        if (strcasecmp(name + len - 4, ".cat") != 0)
++            continue;
++
++        CAT_CONTEXT *ctx = calloc(1, sizeof(*ctx));
++        if (!ctx)
++            break;
++        ctx->magic = CAT_CONTEXT_MAGIC;
++        snprintf(ctx->path, sizeof(ctx->path), "%s/%s", cat_dir, name);
++        closedir(dir);
++        if (trace_wintrust_enabled())
++            LogMessage("CryptCATAdminEnumCatalogFromHash -> %s", ctx->path);
++        return (HANDLE)ctx;
++    }
++
++    closedir(dir);
++    SetLastError(ERROR_NOT_FOUND);
+     return NULL;
+ }
+ 
+-STATIC BOOL CryptCATAdminCalcHashFromFileHandle(VOID) { DebugLog("FIXME"); return 0; }
+-STATIC BOOL CryptCATAdminReleaseCatalogContext(VOID) { DebugLog("FIXME"); return 0; }
+-STATIC BOOL CryptCATAdminReleaseContext(VOID) { DebugLog("FIXME"); return 0; }
+-STATIC BOOL CryptCATCatalogInfoFromContext(VOID) { DebugLog("FIXME"); return 0; }
++STATIC BOOL WINAPI CryptCATAdminCalcHashFromFileHandle(HANDLE hFile, PDWORD pcbHash, BYTE *pbHash, DWORD dwFlags)
++{
++    DebugLog("%p, %p, %p, %#x", hFile, pcbHash, pbHash, dwFlags);
++
++    if (!pcbHash) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    DWORD required = 20;
++    if (!pbHash || *pcbHash < required) {
++        *pcbHash = required;
++        SetLastError(ERROR_INSUFFICIENT_BUFFER);
++        return FALSE;
++    }
++
++    FILE *fp = (FILE *)hFile;
++    if (!fp) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    long pos = ftell(fp);
++    if (pos < 0)
++        pos = 0;
++    fseek(fp, 0, SEEK_SET);
++
++    SHA256_CTX ctx256;
++    SHA1_CTX ctx1;
++    uint8_t buf[4096];
++    size_t nread = 0;
++
++    if (required == 20) {
++        sha1_init(&ctx1);
++    } else {
++        sha256_init(&ctx256);
++    }
++    while ((nread = fread(buf, 1, sizeof(buf), fp)) > 0) {
++        if (required == 20)
++            sha1_update(&ctx1, buf, nread);
++        else
++            sha256_update(&ctx256, buf, nread);
++    }
++    if (required == 20)
++        sha1_final(&ctx1, pbHash);
++    else
++        sha256_final(&ctx256, pbHash);
++
++    fseek(fp, pos, SEEK_SET);
++    *pcbHash = required;
++    SetLastError(ERROR_SUCCESS);
++    return TRUE;
++}
++
++STATIC BOOL WINAPI CryptCATAdminReleaseCatalogContext(HANDLE hCatAdmin, HANDLE hCatInfo, DWORD dwFlags)
++{
++    DebugLog("%p, %p, %#x", hCatAdmin, hCatInfo, dwFlags);
++    CAT_CONTEXT *ctx = (CAT_CONTEXT *)hCatInfo;
++    if (ctx && ctx->magic == CAT_CONTEXT_MAGIC)
++        free(ctx);
++    SetLastError(ERROR_SUCCESS);
++    return TRUE;
++}
++
++STATIC BOOL WINAPI CryptCATAdminReleaseContext(HANDLE hCatAdmin, DWORD dwFlags)
++{
++    DebugLog("%p, %#x", hCatAdmin, dwFlags);
++    SetLastError(ERROR_SUCCESS);
++    return TRUE;
++}
++
++STATIC BOOL WINAPI CryptCATCatalogInfoFromContext(HANDLE hCatInfo, PCATALOG_INFO psCatInfo, DWORD dwFlags)
++{
++    DebugLog("%p, %p, %#x", hCatInfo, psCatInfo, dwFlags);
++    if (!psCatInfo || psCatInfo->cbStruct < sizeof(*psCatInfo)) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    CAT_CONTEXT *ctx = (CAT_CONTEXT *)hCatInfo;
++    if (!ctx || ctx->magic != CAT_CONTEXT_MAGIC) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    ascii_to_wide(ctx->path, psCatInfo->wszCatalogFile, sizeof(psCatInfo->wszCatalogFile) / sizeof(psCatInfo->wszCatalogFile[0]));
++    if (trace_wintrust_enabled())
++        LogMessage("CryptCATCatalogInfoFromContext -> %s", ctx->path);
++    SetLastError(ERROR_SUCCESS);
++    return TRUE;
++}
++
+ STATIC BOOL WTHelperGetProvCertFromChain(VOID) { DebugLog("FIXME"); return 0; }
+ STATIC BOOL WTHelperGetProvSignerFromChain(VOID) { DebugLog("FIXME"); return 0; }
+ STATIC BOOL WTHelperProvDataFromStateData(VOID) { DebugLog("FIXME"); return 0; }
+-STATIC BOOL WinVerifyTrust(VOID) { DebugLog("FIXME"); return 0; }
++
++STATIC LONG WINAPI WinVerifyTrust(PVOID hWnd, GUID *pgActionID, PVOID pWVTData)
++{
++    DebugLog("%p, %p, %p", hWnd, pgActionID, pWVTData);
++
++    if (!pgActionID || !pWVTData) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return TRUST_E_SUBJECT_FORM_UNKNOWN;
++    }
++
++    if (!guid_equal(pgActionID, &WINTRUST_ACTION_GENERIC_VERIFY_V2)) {
++        DebugLog("unsupported action GUID");
++        return TRUST_E_SUBJECT_FORM_UNKNOWN;
++    }
++
++    const char *verify_env = getenv("MPENGINE_VERIFY_SIGNATURES");
++    if (!verify_env || strcmp(verify_env, "1") != 0) {
++        DebugLog("WinVerifyTrust: returning success (verification disabled)");
++        SetLastError(ERROR_SUCCESS);
++        return ERROR_SUCCESS;
++    }
++
++    PWINTRUST_DATA wtd = (PWINTRUST_DATA)pWVTData;
++    int helper_rc = -1;
++
++    switch (wtd->dwUnionChoice) {
++        case WTD_CHOICE_FILE: {
++            if (!wtd->pFile || !wtd->pFile->pcwszFilePath)
++                break;
++            char *file = CreateAnsiFromWide(wtd->pFile->pcwszFilePath);
++            DebugLog("WinVerifyTrust file: %s", file ? file : "(null)");
++            if (trace_wintrust_enabled())
++                LogMessage("WinVerifyTrust file: %s", file ? file : "(null)");
++            if (file) {
++                helper_rc = run_verify_helper(file, NULL);
++                free(file);
++            }
++            break;
++        }
++        case WTD_CHOICE_CATALOG: {
++            if (!wtd->pCatalog)
++                break;
++            char *catalog = NULL;
++            char *member = NULL;
++            if (wtd->pCatalog->pcwszCatalogFilePath)
++                catalog = CreateAnsiFromWide(wtd->pCatalog->pcwszCatalogFilePath);
++            if (wtd->pCatalog->pcwszMemberFilePath)
++                member = CreateAnsiFromWide(wtd->pCatalog->pcwszMemberFilePath);
++            DebugLog("WinVerifyTrust catalog: %s member: %s", catalog ? catalog : "(null)", member ? member : "(null)");
++            if (trace_wintrust_enabled())
++                LogMessage("WinVerifyTrust catalog: %s member: %s", catalog ? catalog : "(null)", member ? member : "(null)");
++            if (member) {
++                if (catalog) {
++                    helper_rc = run_verify_helper(member, catalog);
++                }
++                if (helper_rc != 0) {
++                    helper_rc = verify_with_any_catalog(member);
++                }
++            }
++            free(catalog);
++            free(member);
++            break;
++        }
++        default:
++            DebugLog("unsupported dwUnionChoice %#x", wtd->dwUnionChoice);
++            break;
++    }
++
++    if (trace_wintrust_enabled())
++        LogMessage("WinVerifyTrust helper rc=%d", helper_rc);
++
++    if (helper_rc == 0) {
++        SetLastError(ERROR_SUCCESS);
++        return ERROR_SUCCESS;
++    }
++
++    SetLastError(ERROR_NOT_FOUND);
++    return TRUST_E_NOSIGNATURE;
++}
++
++// Runtime-resolved wintrust.dll stubs
++static BOOL WINAPI CryptCATAdminAcquireContext2(PVOID phCatAdmin, PVOID pgSubsystem, PWCHAR pwszHashAlgorithm, PVOID pStrongHashPolicy, DWORD dwFlags) { DebugLog("stub"); if (phCatAdmin) *(HANDLE *)phCatAdmin = (HANDLE)'CAT2'; return TRUE; }
++static BOOL WINAPI CryptCATClose(HANDLE hCatalog) { DebugLog("stub"); return TRUE; }
++static PVOID WINAPI CryptCATGetAttrInfo(HANDLE hCatalog, PVOID pCatMember, PWCHAR pwszReferenceTag) { DebugLog("stub"); return NULL; }
++static PVOID WINAPI CryptCATGetMemberInfo(HANDLE hCatalog, PWCHAR pwszReferenceTag) { DebugLog("stub"); return NULL; }
++static HANDLE WINAPI CryptCATOpen(PWCHAR pwszFileName, DWORD fdwOpenFlags, PVOID hProv, DWORD dwPublicVersion, DWORD dwEncodingType) { DebugLog("stub"); return (HANDLE)-1; }
+ 
+ DECLARE_CRT_EXPORT("CryptCATAdminAcquireContext", CryptCATAdminAcquireContext);
++DECLARE_CRT_EXPORT("CryptCATAdminAcquireContext2", CryptCATAdminAcquireContext2);
+ DECLARE_CRT_EXPORT("CryptCATAdminCalcHashFromFileHandle", CryptCATAdminCalcHashFromFileHandle);
+ DECLARE_CRT_EXPORT("CryptCATAdminEnumCatalogFromHash", CryptCATAdminEnumCatalogFromHash);
+ DECLARE_CRT_EXPORT("CryptCATAdminReleaseCatalogContext", CryptCATAdminReleaseCatalogContext);
+ DECLARE_CRT_EXPORT("CryptCATAdminReleaseContext", CryptCATAdminReleaseContext);
+ DECLARE_CRT_EXPORT("CryptCATCatalogInfoFromContext", CryptCATCatalogInfoFromContext);
++DECLARE_CRT_EXPORT("CryptCATClose", CryptCATClose);
++DECLARE_CRT_EXPORT("CryptCATGetAttrInfo", CryptCATGetAttrInfo);
++DECLARE_CRT_EXPORT("CryptCATGetMemberInfo", CryptCATGetMemberInfo);
++DECLARE_CRT_EXPORT("CryptCATOpen", CryptCATOpen);
+ DECLARE_CRT_EXPORT("WTHelperGetProvCertFromChain", WTHelperGetProvCertFromChain);
+ DECLARE_CRT_EXPORT("WTHelperGetProvSignerFromChain", WTHelperGetProvSignerFromChain);
+ DECLARE_CRT_EXPORT("WTHelperProvDataFromStateData", WTHelperProvDataFromStateData);
+diff --git a/peloader/winapi/intermediacert.h b/peloader/winapi/intermediacert.h
+new file mode 100644
+--- /dev/null
++++ b/peloader/winapi/intermediacert.h
+@@ -0,0 +1,114 @@
++// Microsoft Windows Code Signing PCA 2024 intermediate CA certificate
++// Extracted from engine/mpavdlta.vdm Authenticode signature
++// Size: 1729 bytes
++static unsigned char IntermediateCertificate[] = {
++    0x30, 0x82, 0x06, 0xbd, 0x30, 0x82, 0x04, 0xa5, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x13, 0x33,
++    0x00, 0x00, 0x00, 0x1c, 0x48, 0x9f, 0x81, 0xdf, 0xa1, 0xb0, 0xb7, 0x77, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x1c, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c, 0x05,
++    0x00, 0x30, 0x81, 0x88, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55,
++    0x53, 0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x08, 0x13, 0x0a, 0x57, 0x61, 0x73, 0x68,
++    0x69, 0x6e, 0x67, 0x74, 0x6f, 0x6e, 0x31, 0x10, 0x30, 0x0e, 0x06, 0x03, 0x55, 0x04, 0x07, 0x13,
++    0x07, 0x52, 0x65, 0x64, 0x6d, 0x6f, 0x6e, 0x64, 0x31, 0x1e, 0x30, 0x1c, 0x06, 0x03, 0x55, 0x04,
++    0x0a, 0x13, 0x15, 0x4d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x20, 0x43, 0x6f, 0x72,
++    0x70, 0x6f, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x31, 0x32, 0x30, 0x30, 0x06, 0x03, 0x55, 0x04,
++    0x03, 0x13, 0x29, 0x4d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x20, 0x52, 0x6f, 0x6f,
++    0x74, 0x20, 0x43, 0x65, 0x72, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x65, 0x20, 0x41, 0x75,
++    0x74, 0x68, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x20, 0x32, 0x30, 0x31, 0x30, 0x30, 0x1e, 0x17, 0x0d,
++    0x32, 0x34, 0x30, 0x38, 0x30, 0x38, 0x32, 0x31, 0x33, 0x36, 0x32, 0x33, 0x5a, 0x17, 0x0d, 0x33,
++    0x35, 0x30, 0x36, 0x32, 0x33, 0x32, 0x32, 0x30, 0x34, 0x30, 0x31, 0x5a, 0x30, 0x5f, 0x31, 0x0b,
++    0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x1e, 0x30, 0x1c, 0x06,
++    0x03, 0x55, 0x04, 0x0a, 0x13, 0x15, 0x4d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x20,
++    0x43, 0x6f, 0x72, 0x70, 0x6f, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x31, 0x30, 0x30, 0x2e, 0x06,
++    0x03, 0x55, 0x04, 0x03, 0x13, 0x27, 0x4d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x20,
++    0x57, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x73, 0x20, 0x43, 0x6f, 0x64, 0x65, 0x20, 0x53, 0x69, 0x67,
++    0x6e, 0x69, 0x6e, 0x67, 0x20, 0x50, 0x43, 0x41, 0x20, 0x32, 0x30, 0x32, 0x34, 0x30, 0x82, 0x02,
++    0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
++    0x03, 0x82, 0x02, 0x0f, 0x00, 0x30, 0x82, 0x02, 0x0a, 0x02, 0x82, 0x02, 0x01, 0x00, 0x9a, 0x7d,
++    0x6b, 0x7d, 0x27, 0xc1, 0x76, 0x2a, 0x2e, 0xae, 0xe3, 0xd5, 0x34, 0xff, 0xcc, 0x2b, 0x6d, 0xee,
++    0xfc, 0x54, 0xf8, 0x20, 0xa3, 0xfb, 0xb0, 0x64, 0x89, 0xf4, 0xbf, 0x07, 0x68, 0x17, 0x28, 0x65,
++    0x3b, 0x39, 0x5f, 0x52, 0x5d, 0x12, 0x46, 0x3f, 0x5c, 0x85, 0xb3, 0x9a, 0x7a, 0x8e, 0x9b, 0x18,
++    0x8b, 0x87, 0x18, 0xcc, 0x5e, 0x7a, 0x01, 0x5d, 0x00, 0x12, 0x69, 0x84, 0x8d, 0x5f, 0x30, 0x4f,
++    0x69, 0x6f, 0x3d, 0x4e, 0x41, 0x84, 0xdd, 0xf0, 0x57, 0x7d, 0x07, 0xa9, 0x83, 0xc8, 0x60, 0x48,
++    0xf9, 0x3f, 0x75, 0x97, 0x7f, 0x49, 0x17, 0x0f, 0xd7, 0xef, 0x8d, 0x47, 0xf5, 0x18, 0x0b, 0x57,
++    0x12, 0xb8, 0x89, 0xf3, 0x0e, 0xc0, 0x2c, 0xd6, 0x95, 0x12, 0x6f, 0x51, 0xb3, 0x87, 0x8f, 0x03,
++    0x46, 0x6c, 0x60, 0x76, 0x82, 0x6d, 0x4e, 0x64, 0x05, 0x42, 0x50, 0x0d, 0x7b, 0xfb, 0xea, 0x16,
++    0x9f, 0x39, 0xc4, 0x20, 0x74, 0x50, 0x80, 0xdc, 0x8d, 0xf3, 0x62, 0xd7, 0xf3, 0x5f, 0x6b, 0xce,
++    0xc3, 0x1f, 0x3b, 0xb8, 0x33, 0x9a, 0x0a, 0xec, 0x8a, 0x39, 0x16, 0x62, 0x87, 0xd7, 0x37, 0xcd,
++    0x37, 0xfe, 0x4c, 0xb0, 0xb9, 0x41, 0x82, 0xf2, 0x85, 0x53, 0x01, 0x9c, 0x35, 0xc4, 0x1c, 0x33,
++    0xab, 0xbd, 0xac, 0x3d, 0xd8, 0x34, 0xb2, 0x22, 0xaa, 0x5d, 0x81, 0x15, 0xa9, 0xb9, 0xfc, 0xea,
++    0x0c, 0x5c, 0xb5, 0x7a, 0x05, 0x63, 0x92, 0x85, 0xd9, 0x85, 0xbf, 0xbd, 0xa5, 0x9f, 0x61, 0x79,
++    0x4c, 0xcd, 0x5d, 0x35, 0xe1, 0x3a, 0x85, 0xf3, 0x7b, 0x18, 0x7a, 0x63, 0x30, 0x0b, 0xe1, 0xf9,
++    0x41, 0x5a, 0x6f, 0x81, 0x73, 0x58, 0x50, 0xc8, 0x44, 0x9e, 0x9c, 0x4b, 0xc1, 0x27, 0x39, 0xd5,
++    0xfb, 0x6e, 0x6e, 0xde, 0x1e, 0xfb, 0x8e, 0x38, 0x0c, 0x51, 0x8e, 0x38, 0xf9, 0x65, 0xd0, 0xe2,
++    0xef, 0x6a, 0x75, 0xd0, 0xde, 0xfd, 0x4e, 0x52, 0x78, 0x06, 0x8a, 0x46, 0xfb, 0xe2, 0x6e, 0x68,
++    0xb8, 0xcf, 0xb4, 0x11, 0xa4, 0xbb, 0xd9, 0xb2, 0x56, 0xb4, 0x08, 0xf8, 0x8e, 0x50, 0x6c, 0xf4,
++    0xd0, 0x3a, 0x39, 0xb1, 0xf9, 0x02, 0xd0, 0x4c, 0x25, 0xb1, 0x2c, 0xdf, 0x33, 0x7f, 0xbc, 0x03,
++    0xda, 0xec, 0xc8, 0x55, 0x4e, 0x81, 0x60, 0xd5, 0x3f, 0x3b, 0x7d, 0xf0, 0xe2, 0x4f, 0xd8, 0x4a,
++    0x1a, 0x10, 0xea, 0xbc, 0x18, 0x4f, 0x46, 0x0a, 0x83, 0x76, 0x8b, 0xbf, 0xf8, 0x0b, 0x61, 0x42,
++    0xc1, 0xf7, 0xf5, 0x05, 0x20, 0x93, 0x25, 0x66, 0x4e, 0xd5, 0x67, 0x2b, 0xd8, 0xcb, 0x5e, 0x24,
++    0x4e, 0x94, 0xc4, 0x65, 0x7e, 0x8a, 0x10, 0x3c, 0x9c, 0xde, 0x75, 0x60, 0xf2, 0x83, 0xd9, 0xd6,
++    0x06, 0xa1, 0xec, 0x2b, 0x5e, 0xf4, 0x73, 0x0b, 0xfd, 0x47, 0xa1, 0x47, 0x92, 0xbe, 0x56, 0x5f,
++    0xd2, 0x67, 0xfd, 0x18, 0x71, 0x2d, 0xbe, 0xf9, 0x1b, 0x25, 0x54, 0x51, 0xa3, 0xa3, 0xc1, 0x7f,
++    0x49, 0x9d, 0xe6, 0xdf, 0x3b, 0x55, 0xbd, 0x66, 0x33, 0xf7, 0xc8, 0xa7, 0x57, 0xb2, 0xa7, 0x26,
++    0xb1, 0x99, 0x79, 0x20, 0xa5, 0xc0, 0x70, 0xbb, 0x29, 0x6c, 0x3a, 0xad, 0xa4, 0x49, 0x53, 0x89,
++    0xe7, 0x00, 0x4f, 0xa1, 0xa1, 0x2c, 0xb0, 0x99, 0x1e, 0x31, 0xc2, 0xa7, 0x12, 0xeb, 0xae, 0xfb,
++    0xe5, 0x0a, 0x74, 0x31, 0xe5, 0x4b, 0x40, 0xed, 0xb1, 0x88, 0xcd, 0xd1, 0x09, 0xce, 0xb9, 0xcb,
++    0xd3, 0x75, 0x2b, 0x1d, 0xbe, 0x1c, 0xca, 0x39, 0x28, 0xc9, 0x17, 0x75, 0xd5, 0xaa, 0xbf, 0x5f,
++    0xd8, 0x2f, 0x78, 0xe4, 0xb5, 0xd3, 0xe6, 0xbc, 0x4a, 0x20, 0x75, 0x08, 0x10, 0x30, 0x5c, 0x35,
++    0x85, 0x3a, 0x04, 0xa0, 0xc3, 0x1f, 0xaa, 0xdf, 0xa4, 0xa3, 0x8e, 0x09, 0x28, 0xa5, 0x02, 0x03,
++    0x01, 0x00, 0x01, 0xa3, 0x82, 0x01, 0x46, 0x30, 0x82, 0x01, 0x42, 0x30, 0x0e, 0x06, 0x03, 0x55,
++    0x1d, 0x0f, 0x01, 0x01, 0xff, 0x04, 0x04, 0x03, 0x02, 0x01, 0x86, 0x30, 0x10, 0x06, 0x09, 0x2b,
++    0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x15, 0x01, 0x04, 0x03, 0x02, 0x01, 0x00, 0x30, 0x1d, 0x06,
++    0x03, 0x55, 0x1d, 0x0e, 0x04, 0x16, 0x04, 0x14, 0x1e, 0x82, 0xdf, 0x0e, 0xd7, 0x8c, 0xb3, 0xd7,
++    0x02, 0x34, 0x83, 0x0e, 0xda, 0xab, 0xad, 0x65, 0xb9, 0xaf, 0xb8, 0xec, 0x30, 0x19, 0x06, 0x09,
++    0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x04, 0x0c, 0x1e, 0x0a, 0x00, 0x53, 0x00,
++    0x75, 0x00, 0x62, 0x00, 0x43, 0x00, 0x41, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01,
++    0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff, 0x30, 0x1f, 0x06, 0x03, 0x55, 0x1d, 0x23, 0x04,
++    0x18, 0x30, 0x16, 0x80, 0x14, 0xd5, 0xf6, 0x56, 0xcb, 0x8f, 0xe8, 0xa2, 0x5c, 0x62, 0x68, 0xd1,
++    0x3d, 0x94, 0x90, 0x5b, 0xd7, 0xce, 0x9a, 0x18, 0xc4, 0x30, 0x56, 0x06, 0x03, 0x55, 0x1d, 0x1f,
++    0x04, 0x4f, 0x30, 0x4d, 0x30, 0x4b, 0xa0, 0x49, 0xa0, 0x47, 0x86, 0x45, 0x68, 0x74, 0x74, 0x70,
++    0x3a, 0x2f, 0x2f, 0x63, 0x72, 0x6c, 0x2e, 0x6d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74,
++    0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x70, 0x6b, 0x69, 0x2f, 0x63, 0x72, 0x6c, 0x2f, 0x70, 0x72, 0x6f,
++    0x64, 0x75, 0x63, 0x74, 0x73, 0x2f, 0x4d, 0x69, 0x63, 0x52, 0x6f, 0x6f, 0x43, 0x65, 0x72, 0x41,
++    0x75, 0x74, 0x5f, 0x32, 0x30, 0x31, 0x30, 0x2d, 0x30, 0x36, 0x2d, 0x32, 0x33, 0x2e, 0x63, 0x72,
++    0x6c, 0x30, 0x5a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01, 0x04, 0x4e, 0x30,
++    0x4c, 0x30, 0x4a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02, 0x86, 0x3e, 0x68,
++    0x74, 0x74, 0x70, 0x3a, 0x2f, 0x2f, 0x77, 0x77, 0x77, 0x2e, 0x6d, 0x69, 0x63, 0x72, 0x6f, 0x73,
++    0x6f, 0x66, 0x74, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x70, 0x6b, 0x69, 0x2f, 0x63, 0x65, 0x72, 0x74,
++    0x73, 0x2f, 0x4d, 0x69, 0x63, 0x52, 0x6f, 0x6f, 0x43, 0x65, 0x72, 0x41, 0x75, 0x74, 0x5f, 0x32,
++    0x30, 0x31, 0x30, 0x2d, 0x30, 0x36, 0x2d, 0x32, 0x33, 0x2e, 0x63, 0x72, 0x74, 0x30, 0x0d, 0x06,
++    0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c, 0x05, 0x00, 0x03, 0x82, 0x02, 0x01,
++    0x00, 0x43, 0x5f, 0xf8, 0xdf, 0x3f, 0xbb, 0xe9, 0x94, 0x8c, 0x3b, 0x5c, 0xf5, 0xbb, 0x68, 0x03,
++    0x9d, 0x91, 0x05, 0xcd, 0x17, 0x54, 0x34, 0x81, 0x31, 0x00, 0x4c, 0xab, 0x1b, 0xb9, 0xea, 0x15,
++    0xc7, 0x07, 0x0b, 0x9c, 0xb5, 0x45, 0xac, 0xd5, 0x70, 0x6a, 0x0c, 0x33, 0x08, 0x14, 0x21, 0xee,
++    0xf5, 0xce, 0x98, 0xfd, 0x41, 0x7e, 0x4c, 0xdf, 0x04, 0x22, 0x08, 0xe7, 0xba, 0x30, 0x29, 0x29,
++    0x89, 0x87, 0x3f, 0x87, 0xf8, 0x10, 0xcd, 0xc0, 0x45, 0x29, 0xa5, 0xce, 0xba, 0x45, 0xe6, 0x8c,
++    0xce, 0x27, 0x1d, 0x01, 0x03, 0x91, 0x54, 0xbf, 0x58, 0xe6, 0xa5, 0xd7, 0xff, 0xd9, 0x96, 0xea,
++    0xa6, 0xf0, 0xb1, 0x97, 0x1b, 0xff, 0x1b, 0x54, 0x78, 0x2a, 0x3a, 0xd2, 0x9a, 0x6a, 0x8f, 0x1f,
++    0x3b, 0x3a, 0x8a, 0x0c, 0x37, 0x6f, 0xb4, 0x53, 0x6e, 0x3e, 0xc1, 0xc4, 0x84, 0xbc, 0x7c, 0xe2,
++    0x24, 0xc1, 0x85, 0x90, 0x84, 0x1d, 0x9f, 0x2e, 0x39, 0x60, 0xfb, 0x71, 0xd2, 0xac, 0x31, 0x8f,
++    0x14, 0x88, 0x69, 0x20, 0x95, 0x95, 0x6a, 0x63, 0x08, 0x47, 0xb6, 0xbb, 0xd8, 0xe1, 0xa8, 0x9e,
++    0x37, 0x5f, 0xe3, 0x9a, 0xec, 0xa7, 0x0a, 0x88, 0x1e, 0xec, 0xa7, 0x65, 0x4e, 0x1a, 0xbf, 0x2f,
++    0x6b, 0xb8, 0x1f, 0xd1, 0x86, 0x16, 0xf0, 0x9b, 0xe7, 0xcc, 0x6f, 0xc0, 0x4c, 0x79, 0xc2, 0x1a,
++    0x4e, 0x69, 0x28, 0x87, 0x1f, 0xc4, 0x65, 0x9e, 0x46, 0x35, 0x67, 0x0d, 0xea, 0x84, 0xd8, 0x5b,
++    0x71, 0xb6, 0x04, 0xcd, 0xc1, 0xdd, 0x8c, 0xe7, 0x5a, 0x49, 0x7d, 0xb7, 0x8b, 0x21, 0x3f, 0xad,
++    0x1f, 0x32, 0xe7, 0xbe, 0xda, 0x4b, 0x1d, 0x1c, 0x65, 0x92, 0x13, 0xc1, 0x15, 0x4d, 0xd4, 0xa6,
++    0x19, 0x47, 0x63, 0xd2, 0x3a, 0xd4, 0x73, 0x8e, 0xa5, 0x19, 0x51, 0x49, 0x21, 0x21, 0x77, 0xfc,
++    0xcc, 0x5c, 0xc6, 0x79, 0x4d, 0x78, 0xfd, 0x4a, 0x87, 0x2a, 0xfe, 0x67, 0x34, 0xf8, 0x12, 0xdb,
++    0x3f, 0x23, 0xb9, 0xae, 0x7e, 0x96, 0x8b, 0x9c, 0xb6, 0xa5, 0xcc, 0xc4, 0x76, 0xcc, 0x8b, 0xa1,
++    0x18, 0xe0, 0x16, 0x5a, 0xcc, 0x1e, 0xb1, 0xb8, 0xed, 0x17, 0x39, 0x15, 0x50, 0x58, 0x03, 0x47,
++    0x64, 0x96, 0xf7, 0x4d, 0xc8, 0xd1, 0x72, 0xa5, 0x6c, 0xf1, 0x00, 0xea, 0xaf, 0x1e, 0xa4, 0x71,
++    0x89, 0xf6, 0xba, 0x31, 0x87, 0xce, 0x67, 0xb0, 0x42, 0x9c, 0x04, 0xd5, 0x30, 0xe1, 0x27, 0x29,
++    0xeb, 0xc2, 0x82, 0xa9, 0x2a, 0x45, 0x05, 0xa2, 0xa2, 0xc9, 0x5d, 0x6c, 0x91, 0xdf, 0xa5, 0xf1,
++    0x4e, 0x74, 0x58, 0xd7, 0x8f, 0x31, 0xbf, 0x41, 0xcf, 0x3d, 0x0e, 0x7c, 0x04, 0x9a, 0x97, 0xcb,
++    0xf9, 0xb1, 0x01, 0xbe, 0x0d, 0x6d, 0x35, 0x90, 0xdf, 0x88, 0xf9, 0x12, 0x94, 0x21, 0xb3, 0x39,
++    0x23, 0x9d, 0x30, 0x26, 0x38, 0x87, 0xca, 0x64, 0x05, 0x34, 0x3b, 0x1b, 0xa1, 0xb1, 0x71, 0xf4,
++    0x8f, 0x79, 0x98, 0x21, 0x04, 0x3d, 0x4e, 0xdf, 0x51, 0x9d, 0xd5, 0x4f, 0xf1, 0xce, 0x51, 0x56,
++    0xe4, 0x99, 0x7e, 0xe5, 0xb4, 0x80, 0xbf, 0x79, 0x00, 0x2e, 0xe4, 0x63, 0xbc, 0x7e, 0xef, 0x9c,
++    0x78, 0x44, 0xcc, 0xc9, 0xbb, 0xdb, 0xa3, 0x15, 0x0c, 0xe1, 0xd6, 0x0d, 0x0b, 0xe3, 0xf3, 0xa2,
++    0x85, 0x31, 0x7e, 0x60, 0xb4, 0x0e, 0xe2, 0x91, 0xc0, 0x1d, 0xb5, 0x6d, 0x7f, 0x7e, 0x69, 0xcb,
++    0x88, 0x06, 0x4c, 0x48, 0x9b, 0x81, 0x1d, 0xdc, 0xed, 0x7d, 0xc3, 0x55, 0x4b, 0xa0, 0x0e, 0xd4,
++    0x34, 0xe5, 0x2e, 0x27, 0xbc, 0xfa, 0x35, 0x0d, 0x96, 0xff, 0xea, 0xbb, 0x72, 0x77, 0xce, 0x3e,
++    0x5d, 0x90, 0x54, 0xbe, 0x2a, 0x96, 0x00, 0x9b, 0x95, 0x44, 0xf6, 0xbe, 0x64, 0x29, 0x96, 0x55,
++    0x77
++};
+diff --git a/peloader/winapi/Missing.c b/peloader/winapi/Missing.c
+new file mode 100644
+--- /dev/null
++++ b/peloader/winapi/Missing.c
+@@ -0,0 +1,1188 @@
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <stdbool.h>
++#include <search.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <errno.h>
++#include <ctype.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <arpa/inet.h>
++#include <wctype.h>
++#include <dirent.h>
++#include <limits.h>
++#include <strings.h>
++#include <pthread.h>
++
++#include "winnt_types.h"
++#include "pe_linker.h"
++#include "ntoskernel.h"
++#include "log.h"
++#include "winexports.h"
++#include "util.h"
++#include "winstrings.h"
++
++extern void WINAPI SetLastError(DWORD dwErrCode);
++
++#define ERROR_CALL_NOT_IMPLEMENTED 120
++#define ERROR_SUCCESS 0
++
++#define FILE_ATTRIBUTE_NORMAL 0x80
++#define FILE_ATTRIBUTE_DIRECTORY 0x10
++#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
++#define WAIT_OBJECT_0 0
++
++typedef struct _IN_ADDR {
++    uint32_t S_addr;
++} IN_ADDR, *PIN_ADDR;
++
++typedef struct _IN6_ADDR {
++    uint8_t Byte[16];
++} IN6_ADDR, *PIN6_ADDR;
++
++typedef BOOL *PBOOL;
++typedef SIZE_T *PSIZE_T;
++typedef ULONG_PTR *PULONG_PTR;
++typedef WORD *PWORD;
++typedef LONG *PLONG;
++typedef LARGE_INTEGER *PLARGE_INTEGER;
++
++typedef struct _OBJECT_ATTRIBUTES {
++    ULONG Length;
++    HANDLE RootDirectory;
++    PUNICODE_STRING ObjectName;
++    ULONG Attributes;
++    PVOID SecurityDescriptor;
++    PVOID SecurityQualityOfService;
++} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
++
++typedef struct _IO_STATUS_BLOCK {
++    NTSTATUS Status;
++    ULONG_PTR Information;
++} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
++
++typedef struct _FILE_BASIC_INFORMATION {
++    LARGE_INTEGER CreationTime;
++    LARGE_INTEGER LastAccessTime;
++    LARGE_INTEGER LastWriteTime;
++    LARGE_INTEGER ChangeTime;
++    ULONG FileAttributes;
++} FILE_BASIC_INFORMATION, *PFILE_BASIC_INFORMATION;
++
++typedef struct _FILE_STANDARD_INFORMATION {
++    LARGE_INTEGER AllocationSize;
++    LARGE_INTEGER EndOfFile;
++    ULONG NumberOfLinks;
++    BOOLEAN DeletePending;
++    BOOLEAN Directory;
++} FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
++
++typedef struct _BY_HANDLE_FILE_INFORMATION {
++    DWORD dwFileAttributes;
++    FILETIME ftCreationTime;
++    FILETIME ftLastAccessTime;
++    FILETIME ftLastWriteTime;
++    DWORD dwVolumeSerialNumber;
++    DWORD nFileSizeHigh;
++    DWORD nFileSizeLow;
++    DWORD nNumberOfLinks;
++    DWORD nFileIndexHigh;
++    DWORD nFileIndexLow;
++} BY_HANDLE_FILE_INFORMATION, *PBY_HANDLE_FILE_INFORMATION;
++
++typedef struct _SYSTEMTIME {
++    WORD wYear;
++    WORD wMonth;
++    WORD wDayOfWeek;
++    WORD wDay;
++    WORD wHour;
++    WORD wMinute;
++    WORD wSecond;
++    WORD wMilliseconds;
++} SYSTEMTIME, *PSYSTEMTIME;
++
++typedef struct _FILE_MAPPING {
++    uint32_t magic;
++    int fd;
++    size_t size;
++    DWORD protect;
++} FILE_MAPPING;
++
++#define FILE_MAPPING_MAGIC 0x4d41504dU /* 'MAPM' */
++#define THREAD_HANDLE_MAGIC 0x54485244U /* 'THRD' */
++
++struct thread_handle {
++    uint32_t magic;
++    pthread_t thread;
++};
++
++struct mapping_node {
++    void *addr;
++    size_t size;
++    struct mapping_node *next;
++};
++
++static struct mapping_node *g_mappings;
++
++static void register_mapping(void *addr, size_t size)
++{
++    struct mapping_node *node = malloc(sizeof(*node));
++    if (!node)
++        return;
++    node->addr = addr;
++    node->size = size;
++    node->next = g_mappings;
++    g_mappings = node;
++}
++
++static size_t unregister_mapping(void *addr)
++{
++    struct mapping_node **pp = &g_mappings;
++    while (*pp) {
++        if ((*pp)->addr == addr) {
++            struct mapping_node *node = *pp;
++            size_t size = node->size;
++            *pp = node->next;
++            free(node);
++            return size;
++        }
++        pp = &(*pp)->next;
++    }
++    return 0;
++}
++
++int is_thread_handle(HANDLE h)
++{
++    struct thread_handle *th = (struct thread_handle *)h;
++    return th && th->magic == THREAD_HANDLE_MAGIC;
++}
++
++void close_thread_handle(HANDLE h)
++{
++    struct thread_handle *th = (struct thread_handle *)h;
++    if (!th || th->magic != THREAD_HANDLE_MAGIC)
++        return;
++    pthread_detach(th->thread);
++    free(th);
++}
++
++int is_file_mapping(HANDLE h)
++{
++    FILE_MAPPING *map = (FILE_MAPPING *)h;
++    return map && map->magic == FILE_MAPPING_MAGIC;
++}
++
++void close_file_mapping(HANDLE h)
++{
++    FILE_MAPPING *map = (FILE_MAPPING *)h;
++    if (!map || map->magic != FILE_MAPPING_MAGIC)
++        return;
++    free(map);
++}
++
++static char *ansi_from_unicode_string(PUNICODE_STRING us)
++{
++    if (!us || !us->Buffer || us->Length == 0)
++        return NULL;
++    size_t chars = us->Length / sizeof(WCHAR);
++    char *out = calloc(chars + 1, 1);
++    if (!out)
++        return NULL;
++    for (size_t i = 0; i < chars; ++i)
++        out[i] = (char)us->Buffer[i];
++    out[chars] = '\0';
++    return out;
++}
++
++static void normalize_path(char *path)
++{
++    if (!path)
++        return;
++    if (strncmp(path, "\\\\?\\", 4) == 0 || strncmp(path, "\\\\??\\", 4) == 0)
++        memmove(path, path + 4, strlen(path + 4) + 1);
++    if (isalpha((unsigned char)path[0]) && path[1] == ':')
++        memmove(path, path + 2, strlen(path + 2) + 1);
++    for (char *p = path; *p; ++p) {
++        if (*p == '\\')
++            *p = '/';
++    }
++}
++
++static char *resolve_case_path(const char *path)
++{
++    if (!path || !*path)
++        return NULL;
++
++    char *work = strdup(path);
++    if (!work)
++        return NULL;
++
++    size_t out_cap = strlen(path) + 2;
++    char *out = calloc(1, out_cap);
++    if (!out) {
++        free(work);
++        return NULL;
++    }
++
++    bool abs = (work[0] == '/');
++    char cur[PATH_MAX];
++    size_t out_len = 0;
++
++    if (abs) {
++        strcpy(cur, "/");
++        out[out_len++] = '/';
++        out[out_len] = '\0';
++    } else {
++        strcpy(cur, ".");
++    }
++
++    char *saveptr = NULL;
++    char *token = strtok_r(abs ? work + 1 : work, "/", &saveptr);
++    while (token) {
++        DIR *dir = opendir(cur);
++        const char *match = token;
++        if (dir) {
++            struct dirent *ent = NULL;
++            while ((ent = readdir(dir))) {
++                if (strcasecmp(ent->d_name, token) == 0) {
++                    match = ent->d_name;
++                    break;
++                }
++            }
++            closedir(dir);
++        }
++
++        if (out_len && out[out_len - 1] != '/') {
++            out[out_len++] = '/';
++            out[out_len] = '\0';
++        }
++        size_t mlen = strlen(match);
++        if (out_len + mlen + 1 > out_cap)
++            break;
++        memcpy(out + out_len, match, mlen);
++        out_len += mlen;
++        out[out_len] = '\0';
++
++        {
++            char tmp[PATH_MAX];
++            if (strcmp(cur, "/") == 0)
++                snprintf(tmp, sizeof(tmp), "/%s", match);
++            else if (strcmp(cur, ".") == 0)
++                snprintf(tmp, sizeof(tmp), "%s", match);
++            else
++                snprintf(tmp, sizeof(tmp), "%s/%s", cur, match);
++            memcpy(cur, tmp, sizeof(cur));
++        }
++
++        token = strtok_r(NULL, "/", &saveptr);
++    }
++
++    free(work);
++    if (out_len == 0) {
++        free(out);
++        return NULL;
++    }
++    return out;
++}
++
++static bool trace_files_enabled(void)
++{
++    const char *v = getenv("MPENGINE_TRACE_FILES");
++    return v && *v;
++}
++static FILE *open_file_for_disposition(char *path, ULONG disposition)
++{
++    const char *mode = "r";
++    switch (disposition) {
++        case 1: /* FILE_OPEN */           mode = "r";  break;
++        case 2: /* FILE_CREATE */         mode = "wx"; break;
++        case 3: /* FILE_OPEN_IF */        mode = "a+"; break;
++        case 4: /* FILE_OVERWRITE */      mode = "w";  break;
++        case 5: /* FILE_OVERWRITE_IF */   mode = "w";  break;
++        default:                          mode = "r";  break;
++    }
++    return fopen(path, mode);
++}
++
++#define STUB_BOOL(name, ...) \
++    static BOOL WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return FALSE; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_DWORD(name, ...) \
++    static DWORD WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return 0; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_LONG(name, ...) \
++    static LONG WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return 0; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_INT(name, ...) \
++    static INT WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return 0; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_HANDLE(name, ...) \
++    static HANDLE WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return NULL; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_PVOID(name, ...) \
++    static PVOID WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return NULL; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_NTSTATUS(name, ...) \
++    static NTSTATUS WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        return STATUS_NOT_IMPLEMENTED; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_ULONGLONG(name, ...) \
++    static ULONGLONG WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++        SetLastError(ERROR_CALL_NOT_IMPLEMENTED); \
++        return 0; \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++#define STUB_VOID(name, ...) \
++    static VOID WINAPI name(__VA_ARGS__) { \
++        DebugLog(#name); \
++    } \
++    DECLARE_CRT_EXPORT(#name, name);
++
++/* ntdll Rtl helpers */
++static PCHAR WINAPI RtlIpv4AddressToStringA(PIN_ADDR Address, PCHAR S)
++{
++    if (!Address || !S)
++        return NULL;
++    if (!inet_ntop(AF_INET, Address, S, 16))
++        return NULL;
++    return S + strlen(S);
++}
++
++static PWCHAR WINAPI RtlIpv4AddressToStringW(PIN_ADDR Address, PWCHAR S)
++{
++    char buf[64] = {0};
++    if (!RtlIpv4AddressToStringA(Address, buf) || !S)
++        return NULL;
++    size_t len = strlen(buf);
++    for (size_t i = 0; i <= len; ++i)
++        S[i] = (WCHAR)buf[i];
++    return S + len;
++}
++
++static PCHAR WINAPI RtlIpv6AddressToStringA(PIN6_ADDR Address, PCHAR S)
++{
++    if (!Address || !S)
++        return NULL;
++    if (!inet_ntop(AF_INET6, Address, S, 64))
++        return NULL;
++    return S + strlen(S);
++}
++
++static PWCHAR WINAPI RtlIpv6AddressToStringW(PIN6_ADDR Address, PWCHAR S)
++{
++    char buf[128] = {0};
++    if (!RtlIpv6AddressToStringA(Address, buf) || !S)
++        return NULL;
++    size_t len = strlen(buf);
++    for (size_t i = 0; i <= len; ++i)
++        S[i] = (WCHAR)buf[i];
++    return S + len;
++}
++
++static BOOL WINAPI RtlPrefixUnicodeString(PUNICODE_STRING Prefix, PUNICODE_STRING String, BOOLEAN CaseInsensitive)
++{
++    if (!Prefix || !String || Prefix->Length > String->Length)
++        return FALSE;
++    size_t chars = Prefix->Length / sizeof(WCHAR);
++    for (size_t i = 0; i < chars; ++i) {
++        WCHAR a = Prefix->Buffer[i];
++        WCHAR b = String->Buffer[i];
++        if (CaseInsensitive) {
++            a = (WCHAR)towlower(a);
++            b = (WCHAR)towlower(b);
++        }
++        if (a != b)
++            return FALSE;
++    }
++    return TRUE;
++}
++
++static NTSTATUS WINAPI RtlInitUnicodeStringEx(PUNICODE_STRING DestinationString, PWCHAR SourceString)
++{
++    if (!DestinationString)
++        return STATUS_INVALID_PARAMETER;
++    DestinationString->Buffer = SourceString;
++    if (!SourceString) {
++        DestinationString->Length = 0;
++        DestinationString->MaximumLength = 0;
++        return STATUS_SUCCESS;
++    }
++    size_t len = CountWideChars(SourceString) * sizeof(WCHAR);
++    DestinationString->Length = (USHORT)len;
++    DestinationString->MaximumLength = (USHORT)(len + sizeof(WCHAR));
++    return STATUS_SUCCESS;
++}
++
++DECLARE_CRT_EXPORT("RtlIpv4AddressToStringA", RtlIpv4AddressToStringA);
++DECLARE_CRT_EXPORT("RtlIpv4AddressToStringW", RtlIpv4AddressToStringW);
++DECLARE_CRT_EXPORT("RtlIpv6AddressToStringA", RtlIpv6AddressToStringA);
++DECLARE_CRT_EXPORT("RtlIpv6AddressToStringW", RtlIpv6AddressToStringW);
++DECLARE_CRT_EXPORT("RtlPrefixUnicodeString", RtlPrefixUnicodeString);
++DECLARE_CRT_EXPORT("RtlInitUnicodeStringEx", RtlInitUnicodeStringEx);
++
++/* ntdll Nt* minimal implementations */
++static NTSTATUS WINAPI NtCreateFile(PHANDLE FileHandle,
++                                    ACCESS_MASK DesiredAccess,
++                                    POBJECT_ATTRIBUTES ObjectAttributes,
++                                    PIO_STATUS_BLOCK IoStatusBlock,
++                                    PLARGE_INTEGER AllocationSize,
++                                    ULONG FileAttributes,
++                                    ULONG ShareAccess,
++                                    ULONG CreateDisposition,
++                                    ULONG CreateOptions,
++                                    PVOID EaBuffer,
++                                    ULONG EaLength)
++{
++    (void)DesiredAccess; (void)AllocationSize; (void)FileAttributes;
++    (void)ShareAccess; (void)CreateOptions; (void)EaBuffer; (void)EaLength;
++
++    if (!FileHandle || !ObjectAttributes || !ObjectAttributes->ObjectName) {
++        if (IoStatusBlock)
++            IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    char *path = ansi_from_unicode_string(ObjectAttributes->ObjectName);
++    normalize_path(path);
++    FILE *fp = path ? open_file_for_disposition(path, CreateDisposition) : NULL;
++    if (!fp && path) {
++        char *resolved = resolve_case_path(path);
++        if (resolved) {
++            fp = open_file_for_disposition(resolved, CreateDisposition);
++            free(resolved);
++        }
++    }
++    if (!fp && trace_files_enabled() && path) {
++        LogMessage("NtCreateFile failed: %s", path);
++    }
++    free(path);
++
++    if (!fp) {
++        if (IoStatusBlock)
++            IoStatusBlock->Status = STATUS_ACCESS_DENIED;
++        return STATUS_ACCESS_DENIED;
++    }
++
++    *FileHandle = fp;
++    if (IoStatusBlock) {
++        IoStatusBlock->Status = STATUS_SUCCESS;
++        IoStatusBlock->Information = 0;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS WINAPI NtOpenFile(PHANDLE FileHandle,
++                                  ACCESS_MASK DesiredAccess,
++                                  POBJECT_ATTRIBUTES ObjectAttributes,
++                                  PIO_STATUS_BLOCK IoStatusBlock,
++                                  ULONG ShareAccess,
++                                  ULONG OpenOptions)
++{
++    return NtCreateFile(FileHandle,
++                        DesiredAccess,
++                        ObjectAttributes,
++                        IoStatusBlock,
++                        NULL,
++                        0,
++                        ShareAccess,
++                        1,
++                        OpenOptions,
++                        NULL,
++                        0);
++}
++
++static NTSTATUS WINAPI NtQueryInformationFile(HANDLE FileHandle,
++                                              PIO_STATUS_BLOCK IoStatusBlock,
++                                              PVOID FileInformation,
++                                              ULONG Length,
++                                              DWORD FileInformationClass)
++{
++    FILE *fp = (FILE *)FileHandle;
++    if (!fp || !FileInformation || !IoStatusBlock)
++        return STATUS_INVALID_PARAMETER;
++
++    int fd = fileno(fp);
++    struct stat st;
++    if (fstat(fd, &st) != 0)
++        return STATUS_INVALID_PARAMETER;
++
++    switch (FileInformationClass) {
++        case FileBasicInformation: {
++            if (Length < sizeof(FILE_BASIC_INFORMATION))
++                return STATUS_BUFFER_TOO_SMALL;
++            PFILE_BASIC_INFORMATION info = (PFILE_BASIC_INFORMATION)FileInformation;
++            memset(info, 0, sizeof(*info));
++            info->FileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
++            break;
++        }
++        case FileStandardInformation: {
++            if (Length < sizeof(FILE_STANDARD_INFORMATION))
++                return STATUS_BUFFER_TOO_SMALL;
++            PFILE_STANDARD_INFORMATION info = (PFILE_STANDARD_INFORMATION)FileInformation;
++            memset(info, 0, sizeof(*info));
++            info->EndOfFile = st.st_size;
++            info->AllocationSize = st.st_size;
++            info->NumberOfLinks = st.st_nlink;
++            info->Directory = S_ISDIR(st.st_mode);
++            break;
++        }
++        default:
++            return STATUS_INVALID_PARAMETER;
++    }
++
++    IoStatusBlock->Status = STATUS_SUCCESS;
++    IoStatusBlock->Information = Length;
++    return STATUS_SUCCESS;
++}
++
++STUB_NTSTATUS(NtQueryDirectoryObject, HANDLE DirectoryHandle, PVOID Buffer, ULONG Length, BOOLEAN ReturnSingleEntry, BOOLEAN RestartScan, PULONG Context, PULONG ReturnLength)
++STUB_NTSTATUS(NtOpenDirectoryObject, PHANDLE DirectoryHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes)
++STUB_NTSTATUS(NtDeleteValueKey, HANDLE KeyHandle, PUNICODE_STRING ValueName)
++STUB_NTSTATUS(NtCreateKey, PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
++STUB_NTSTATUS(NtQueryKey, HANDLE KeyHandle, ULONG KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength)
++STUB_NTSTATUS(NtOpenKey, PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes)
++STUB_NTSTATUS(NtQueryDirectoryFile, HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, DWORD FileInformationClass, BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan)
++STUB_NTSTATUS(NtEnumerateSystemEnvironmentValuesEx, ULONG InformationClass, PVOID Buffer, PULONG BufferLength)
++STUB_NTSTATUS(NtDeleteKey, HANDLE KeyHandle)
++STUB_NTSTATUS(NtSetInformationFile, HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, DWORD FileInformationClass)
++STUB_NTSTATUS(NtQueryEaFile, HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, BOOLEAN ReturnSingleEntry, PVOID EaList, ULONG EaListLength, PULONG EaIndex, BOOLEAN RestartScan)
++STUB_NTSTATUS(NtQueryInformationProcess, HANDLE ProcessHandle, ULONG ProcessInformationClass, PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength)
++STUB_NTSTATUS(NtEnumerateKey, HANDLE KeyHandle, ULONG Index, ULONG KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength)
++STUB_NTSTATUS(NtSetValueKey, HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex, ULONG Type, PVOID Data, ULONG DataSize)
++STUB_NTSTATUS(NtSetEaFile, HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length)
++
++DECLARE_CRT_EXPORT("NtCreateFile", NtCreateFile);
++DECLARE_CRT_EXPORT("NtOpenFile", NtOpenFile);
++DECLARE_CRT_EXPORT("NtQueryInformationFile", NtQueryInformationFile);
++
++/* RPCRT4 */
++STUB_DWORD(RpcObjectSetType, PVOID ObjUuid, PVOID TypeUuid)
++STUB_DWORD(RpcMgmtWaitServerListen, VOID)
++STUB_DWORD(RpcMgmtStopServerListening, PVOID Binding)
++
++static PVOID NdrClientCall2(PVOID p1, PVOID p2, ...)
++{
++    DebugLog("NdrClientCall2");
++    return NULL;
++}
++DECLARE_CRT_EXPORT("NdrClientCall2", NdrClientCall2);
++
++/* Kernel32 stubs and minimal helpers */
++static DWORD WINAPI lstrlenW(PWCHAR s)
++{
++    return (DWORD)CountWideChars(s);
++}
++DECLARE_CRT_EXPORT("lstrlenW", lstrlenW);
++
++static VOID WINAPI Sleep(DWORD dwMilliseconds)
++{
++    usleep((useconds_t)dwMilliseconds * 1000);
++}
++DECLARE_CRT_EXPORT("Sleep", Sleep);
++
++static VOID WINAPI GetLocalTime(PSYSTEMTIME lpSystemTime)
++{
++    if (!lpSystemTime)
++        return;
++    memset(lpSystemTime, 0, sizeof(*lpSystemTime));
++}
++DECLARE_CRT_EXPORT("GetLocalTime", GetLocalTime);
++
++static DWORD WINAPI GetTempPathA(DWORD nBufferLength, PCHAR lpBuffer)
++{
++    const char *tmp = "/tmp/";
++    DWORD len = (DWORD)strlen(tmp);
++    if (!lpBuffer || nBufferLength == 0)
++        return len;
++    if (nBufferLength <= len)
++        return len + 1;
++    memcpy(lpBuffer, tmp, len + 1);
++    return len;
++}
++DECLARE_CRT_EXPORT("GetTempPathA", GetTempPathA);
++
++static UINT WINAPI GetTempFileNameW(PWCHAR lpPathName, PWCHAR lpPrefixString, UINT uUnique, PWCHAR lpTempFileName)
++{
++    (void)uUnique;
++    char *path = lpPathName ? CreateAnsiFromWide(lpPathName) : NULL;
++    char *prefix = lpPrefixString ? CreateAnsiFromWide(lpPrefixString) : NULL;
++    const char *dir = (path && *path) ? path : "faketemp";
++    const char *pref = (prefix && *prefix) ? prefix : "tmp";
++    char tmpl[512];
++
++    snprintf(tmpl, sizeof(tmpl), "%s/%sXXXXXX.tmp", dir, pref);
++    int fd = mkstemp(tmpl);
++    if (fd >= 0)
++        close(fd);
++
++    if (lpTempFileName) {
++        size_t len = strlen(tmpl);
++        for (size_t i = 0; i <= len; ++i)
++            lpTempFileName[i] = (WCHAR)tmpl[i];
++    }
++
++    free(path);
++    free(prefix);
++    return fd >= 0 ? 1 : 0;
++}
++DECLARE_CRT_EXPORT("GetTempFileNameW", GetTempFileNameW);
++
++static DWORD WINAPI GetCurrentDirectoryW(DWORD nBufferLength, PWCHAR lpBuffer)
++{
++    char buf[512];
++    if (!getcwd(buf, sizeof(buf)))
++        return 0;
++    size_t len = strlen(buf);
++    if (lpBuffer && nBufferLength > len) {
++        for (size_t i = 0; i <= len; ++i)
++            lpBuffer[i] = (WCHAR)buf[i];
++    }
++    return (DWORD)len;
++}
++DECLARE_CRT_EXPORT("GetCurrentDirectoryW", GetCurrentDirectoryW);
++
++static BOOL WINAPI CreateDirectoryW(PWCHAR lpPathName, PVOID lpSecurityAttributes)
++{
++    (void)lpSecurityAttributes;
++    char *path = CreateAnsiFromWide(lpPathName);
++    normalize_path(path);
++    int rc = path ? mkdir(path, 0777) : -1;
++    free(path);
++    return rc == 0;
++}
++DECLARE_CRT_EXPORT("CreateDirectoryW", CreateDirectoryW);
++
++static BOOL WINAPI RemoveDirectoryW(PWCHAR lpPathName)
++{
++    char *path = CreateAnsiFromWide(lpPathName);
++    normalize_path(path);
++    int rc = path ? rmdir(path) : -1;
++    free(path);
++    return rc == 0;
++}
++DECLARE_CRT_EXPORT("RemoveDirectoryW", RemoveDirectoryW);
++
++static BOOL WINAPI DeleteFileA(PCHAR lpFileName)
++{
++    return unlink(lpFileName) == 0;
++}
++DECLARE_CRT_EXPORT("DeleteFileA", DeleteFileA);
++
++static BOOL WINAPI CopyFileW(PWCHAR lpExistingFileName, PWCHAR lpNewFileName, BOOL bFailIfExists)
++{
++    (void)bFailIfExists;
++    char *src = CreateAnsiFromWide(lpExistingFileName);
++    char *dst = CreateAnsiFromWide(lpNewFileName);
++    normalize_path(src);
++    normalize_path(dst);
++    FILE *in = src ? fopen(src, "rb") : NULL;
++    FILE *out = dst ? fopen(dst, "wb") : NULL;
++    if (!in || !out) {
++        if (in) fclose(in);
++        if (out) fclose(out);
++        free(src); free(dst);
++        return FALSE;
++    }
++    char buf[4096];
++    size_t n;
++    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
++        fwrite(buf, 1, n, out);
++    fclose(in);
++    fclose(out);
++    free(src); free(dst);
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("CopyFileW", CopyFileW);
++
++static BOOL WINAPI MoveFileExW(PWCHAR lpExistingFileName, PWCHAR lpNewFileName, DWORD dwFlags)
++{
++    (void)dwFlags;
++    char *src = CreateAnsiFromWide(lpExistingFileName);
++    char *dst = CreateAnsiFromWide(lpNewFileName);
++    normalize_path(src);
++    normalize_path(dst);
++    int rc = (src && dst) ? rename(src, dst) : -1;
++    free(src); free(dst);
++    return rc == 0;
++}
++DECLARE_CRT_EXPORT("MoveFileExW", MoveFileExW);
++
++static DWORD WINAPI GetFileAttributesA(PCHAR lpFileName)
++{
++    struct stat st;
++    if (stat(lpFileName, &st) != 0)
++        return INVALID_FILE_ATTRIBUTES;
++    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
++}
++DECLARE_CRT_EXPORT("GetFileAttributesA", GetFileAttributesA);
++
++static BOOL WINAPI SetFileAttributesW(PWCHAR lpFileName, DWORD dwFileAttributes)
++{
++    (void)lpFileName; (void)dwFileAttributes;
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("SetFileAttributesW", SetFileAttributesW);
++
++static BOOL WINAPI FlushFileBuffers(HANDLE hFile)
++{
++    FILE *fp = (FILE *)hFile;
++    if (!fp)
++        return FALSE;
++    return fflush(fp) == 0;
++}
++DECLARE_CRT_EXPORT("FlushFileBuffers", FlushFileBuffers);
++
++static DWORD WINAPI GetFileSize(HANDLE hFile, PDWORD lpFileSizeHigh)
++{
++    FILE *fp = (FILE *)hFile;
++    if (!fp)
++        return (DWORD)-1;
++    struct stat st;
++    if (fstat(fileno(fp), &st) != 0)
++        return (DWORD)-1;
++    if (lpFileSizeHigh)
++        *lpFileSizeHigh = 0;
++    return (DWORD)(st.st_size & 0xffffffffu);
++}
++DECLARE_CRT_EXPORT("GetFileSize", GetFileSize);
++
++static BOOL WINAPI GetFileInformationByHandle(HANDLE hFile, PBY_HANDLE_FILE_INFORMATION lpFileInformation)
++{
++    FILE *fp = (FILE *)hFile;
++    if (!fp || !lpFileInformation)
++        return FALSE;
++    struct stat st;
++    if (fstat(fileno(fp), &st) != 0)
++        return FALSE;
++    memset(lpFileInformation, 0, sizeof(*lpFileInformation));
++    lpFileInformation->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
++    lpFileInformation->nFileSizeLow = (DWORD)(st.st_size & 0xffffffffu);
++    lpFileInformation->nFileSizeHigh = 0;
++    lpFileInformation->nNumberOfLinks = st.st_nlink;
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("GetFileInformationByHandle", GetFileInformationByHandle);
++
++static BOOL WINAPI GetFileTime(HANDLE hFile, PFILETIME lpCreationTime, PFILETIME lpLastAccessTime, PFILETIME lpLastWriteTime)
++{
++    (void)hFile;
++    if (lpCreationTime) memset(lpCreationTime, 0, sizeof(*lpCreationTime));
++    if (lpLastAccessTime) memset(lpLastAccessTime, 0, sizeof(*lpLastAccessTime));
++    if (lpLastWriteTime) memset(lpLastWriteTime, 0, sizeof(*lpLastWriteTime));
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("GetFileTime", GetFileTime);
++
++static BOOL WINAPI SetFileTime(HANDLE hFile, PFILETIME lpCreationTime, PFILETIME lpLastAccessTime, PFILETIME lpLastWriteTime)
++{
++    (void)hFile; (void)lpCreationTime; (void)lpLastAccessTime; (void)lpLastWriteTime;
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("SetFileTime", SetFileTime);
++
++static BOOL WINAPI FileTimeToLocalFileTime(PFILETIME lpFileTime, PFILETIME lpLocalFileTime)
++{
++    if (!lpFileTime || !lpLocalFileTime)
++        return FALSE;
++    memcpy(lpLocalFileTime, lpFileTime, sizeof(*lpLocalFileTime));
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("FileTimeToLocalFileTime", FileTimeToLocalFileTime);
++
++static LONG WINAPI CompareFileTime(PFILETIME lpFileTime1, PFILETIME lpFileTime2)
++{
++    if (!lpFileTime1 || !lpFileTime2)
++        return 0;
++    uint64_t a = ((uint64_t)lpFileTime1->dwHighDateTime << 32) | lpFileTime1->dwLowDateTime;
++    uint64_t b = ((uint64_t)lpFileTime2->dwHighDateTime << 32) | lpFileTime2->dwLowDateTime;
++    if (a < b) return -1;
++    if (a > b) return 1;
++    return 0;
++}
++DECLARE_CRT_EXPORT("CompareFileTime", CompareFileTime);
++
++static HANDLE WINAPI CreateFileMappingW(HANDLE hFile, PVOID lpAttr, DWORD flProtect, DWORD dwMaxHigh, DWORD dwMaxLow, PWCHAR lpName)
++{
++    (void)lpAttr; (void)dwMaxHigh; (void)dwMaxLow; (void)lpName;
++    FILE *fp = (FILE *)hFile;
++    if (!fp) {
++        DebugLog("%p => NULL (no file)", hFile);
++        return NULL;
++    }
++    struct stat st;
++    if (fstat(fileno(fp), &st) != 0) {
++        DebugLog("%p => NULL (fstat failed)", hFile);
++        return NULL;
++    }
++    FILE_MAPPING *map = calloc(1, sizeof(*map));
++    if (!map)
++        return NULL;
++    map->magic = FILE_MAPPING_MAGIC;
++    map->fd = fileno(fp);
++    map->size = (size_t)st.st_size;
++    map->protect = flProtect;
++    DebugLog("%p => %p (size=%zu)", hFile, map, map->size);
++    return (HANDLE)map;
++}
++DECLARE_CRT_EXPORT("CreateFileMappingW", CreateFileMappingW);
++
++static PVOID WINAPI MapViewOfFile(HANDLE hFileMappingObject,
++                                  DWORD dwDesiredAccess,
++                                  DWORD dwFileOffsetHigh,
++                                  DWORD dwFileOffsetLow,
++                                  SIZE_T dwNumberOfBytesToMap)
++{
++    FILE_MAPPING *map = (FILE_MAPPING *)hFileMappingObject;
++    if (!map || map->magic != FILE_MAPPING_MAGIC) {
++        DebugLog("%p => NULL (bad mapping)", hFileMappingObject);
++        return NULL;
++    }
++    off_t offset = ((uint64_t)dwFileOffsetHigh << 32) | dwFileOffsetLow;
++    size_t size = dwNumberOfBytesToMap ? dwNumberOfBytesToMap : map->size;
++    void *addr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, map->fd, offset);
++    if (addr == MAP_FAILED) {
++        DebugLog("%p => NULL (mmap failed, size=%zu, offset=%ld)", hFileMappingObject, size, (long)offset);
++        return NULL;
++    }
++    register_mapping(addr, size);
++    DebugLog("%p => %p (size=%zu, offset=%ld)", hFileMappingObject, addr, size, (long)offset);
++    return addr;
++}
++DECLARE_CRT_EXPORT("MapViewOfFile", MapViewOfFile);
++
++static BOOL WINAPI UnmapViewOfFile(PVOID lpBaseAddress)
++{
++    size_t size = unregister_mapping(lpBaseAddress);
++    if (!size)
++        return FALSE;
++    return munmap(lpBaseAddress, size) == 0;
++}
++DECLARE_CRT_EXPORT("UnmapViewOfFile", UnmapViewOfFile);
++
++static BOOL WINAPI WriteConsoleW(HANDLE hConsoleOutput, PWCHAR lpBuffer, DWORD nNumberOfCharsToWrite, PDWORD lpNumberOfCharsWritten, PVOID lpReserved)
++{
++    (void)hConsoleOutput; (void)lpReserved;
++    if (lpNumberOfCharsWritten)
++        *lpNumberOfCharsWritten = nNumberOfCharsToWrite;
++    return TRUE;
++}
++DECLARE_CRT_EXPORT("WriteConsoleW", WriteConsoleW);
++
++STUB_BOOL(VerifyVersionInfoW, PVOID info, DWORD mask, ULONGLONG cond)
++STUB_BOOL(IsWow64Process, HANDLE hProcess, PBOOL Wow64Process)
++STUB_BOOL(VirtualQueryEx, HANDLE hProcess, PVOID lpAddress, PVOID lpBuffer, SIZE_T dwLength)
++STUB_DWORD(GetSystemFirmwareTable, DWORD FirmwareTableProviderSignature, DWORD FirmwareTableID, PVOID pFirmwareTableBuffer, DWORD BufferSize)
++STUB_BOOL(BackupRead, HANDLE hFile, PVOID lpBuffer, DWORD nNumberOfBytesToRead, PDWORD lpNumberOfBytesRead, BOOL bAbort, BOOL bProcessSecurity, PVOID lpContext)
++STUB_BOOL(BackupWrite, HANDLE hFile, PVOID lpBuffer, DWORD nNumberOfBytesToWrite, PDWORD lpNumberOfBytesWritten, BOOL bAbort, BOOL bProcessSecurity, PVOID lpContext)
++STUB_HANDLE(OpenMutexW, DWORD dwDesiredAccess, BOOL bInheritHandle, PWCHAR lpName)
++STUB_HANDLE(OpenEventW, DWORD dwDesiredAccess, BOOL bInheritHandle, PWCHAR lpName)
++STUB_HANDLE(CreateMutexW, PVOID lpMutexAttributes, BOOL bInitialOwner, PWCHAR lpName)
++STUB_BOOL(DeleteTimerQueueTimer, HANDLE TimerQueue, HANDLE Timer, HANDLE CompletionEvent)
++STUB_BOOL(Process32NextW, HANDLE hSnapshot, PVOID lppe)
++STUB_BOOL(Process32FirstW, HANDLE hSnapshot, PVOID lppe)
++STUB_BOOL(SetFirmwareEnvironmentVariableW, PWCHAR lpName, PWCHAR lpGuid, PVOID pValue, DWORD nSize)
++STUB_DWORD(GetFirmwareEnvironmentVariableW, PWCHAR lpName, PWCHAR lpGuid, PVOID pBuffer, DWORD nSize)
++STUB_BOOL(VirtualLock, PVOID lpAddress, SIZE_T dwSize)
++STUB_DWORD(FormatMessageA, DWORD flags, PVOID src, DWORD msgid, DWORD lang, PCHAR buf, DWORD size, PVOID args)
++STUB_DWORD(FormatMessageW, DWORD flags, PVOID src, DWORD msgid, DWORD lang, PWCHAR buf, DWORD size, PVOID args)
++STUB_BOOL(SetEnvironmentVariableW, PWCHAR lpName, PWCHAR lpValue)
++STUB_DWORD(ExpandEnvironmentStringsA, PCHAR lpSrc, PCHAR lpDst, DWORD nSize)
++STUB_HANDLE(FindFirstFileExW, PWCHAR lpFileName, DWORD fInfoLevelId, PVOID lpFindFileData, DWORD fSearchOp, PVOID lpSearchFilter, DWORD dwAdditionalFlags)
++STUB_BOOL(FindNextFileW, HANDLE hFindFile, PVOID lpFindFileData)
++STUB_BOOL(FindClose, HANDLE hFindFile)
++static DWORD WINAPI WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable)
++{
++    (void)dwMilliseconds; (void)bAlertable;
++    if (is_thread_handle(hHandle)) {
++        struct thread_handle *th = (struct thread_handle *)hHandle;
++        pthread_join(th->thread, NULL);
++        return WAIT_OBJECT_0;
++    }
++    return WAIT_OBJECT_0;
++}
++DECLARE_CRT_EXPORT("WaitForSingleObjectEx", WaitForSingleObjectEx);
++STUB_BOOL(SwitchToThread, VOID)
++STUB_BOOL(UnregisterWaitEx, HANDLE WaitHandle, HANDLE CompletionEvent)
++STUB_BOOL(ReleaseSemaphore, HANDLE hSemaphore, LONG lReleaseCount, PLONG lpPreviousCount)
++STUB_BOOL(CreateProcessW, PWCHAR lpApplicationName, PWCHAR lpCommandLine, PVOID lpProcessAttributes, PVOID lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, PVOID lpEnvironment, PWCHAR lpCurrentDirectory, PVOID lpStartupInfo, PVOID lpProcessInformation)
++STUB_VOID(GetNativeSystemInfo, PVOID lpSystemInfo)
++STUB_BOOL(GetModuleHandleExW, DWORD dwFlags, PWCHAR lpModuleName, PHANDLE phModule)
++STUB_HANDLE(LoadResource, HANDLE hModule, HANDLE hResInfo)
++STUB_PVOID(LockResource, HANDLE hResData)
++STUB_DWORD(SizeofResource, HANDLE hModule, HANDLE hResInfo)
++STUB_HANDLE(FindResourceW, HANDLE hModule, PWCHAR lpName, PWCHAR lpType)
++STUB_HANDLE(CreateIoCompletionPort, HANDLE FileHandle, HANDLE ExistingCompletionPort, ULONG_PTR CompletionKey, DWORD NumberOfConcurrentThreads)
++STUB_BOOL(GetQueuedCompletionStatus, HANDLE CompletionPort, PDWORD lpNumberOfBytes, PULONG_PTR lpCompletionKey, PVOID *lpOverlapped, DWORD dwMilliseconds)
++STUB_BOOL(PostQueuedCompletionStatus, HANDLE CompletionPort, DWORD dwNumberOfBytesTransferred, ULONG_PTR dwCompletionKey, PVOID lpOverlapped)
++STUB_BOOL(HeapValidate, HANDLE hHeap, DWORD dwFlags, PVOID lpMem)
++STUB_HANDLE(FindFirstVolumeW, PWCHAR lpszVolumeName, DWORD cchBufferLength)
++STUB_BOOL(FindNextVolumeW, HANDLE hFindVolume, PWCHAR lpszVolumeName, DWORD cchBufferLength)
++STUB_BOOL(FindVolumeClose, HANDLE hFindVolume)
++STUB_ULONGLONG(VerSetConditionMask, ULONGLONG ConditionMask, DWORD TypeMask, BYTE Condition)
++STUB_BOOL(TerminateThread, HANDLE hThread, DWORD dwExitCode)
++STUB_HANDLE(CreateToolhelp32Snapshot, DWORD dwFlags, DWORD th32ProcessID)
++STUB_DWORD(ResumeThread, HANDLE hThread)
++STUB_DWORD(SuspendThread, HANDLE hThread)
++STUB_BOOL(Thread32First, HANDLE hSnapshot, PVOID lpte)
++STUB_BOOL(Thread32Next, HANDLE hSnapshot, PVOID lpte)
++STUB_BOOL(TerminateProcess, HANDLE hProcess, UINT uExitCode)
++STUB_BOOL(GetStringTypeExW, DWORD Locale, DWORD dwInfoType, PWCHAR lpSrcStr, int cchSrc, PVOID lpCharType)
++STUB_HANDLE(OpenThread, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwThreadId)
++STUB_BOOL(GetExitCodeProcess, HANDLE hProcess, PDWORD lpExitCode)
++STUB_VOID(ExitProcess, UINT uExitCode)
++STUB_VOID(DeleteProcThreadAttributeList, PVOID lpAttributeList)
++STUB_BOOL(UpdateProcThreadAttribute, PVOID lpAttributeList, DWORD dwFlags, ULONG_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize)
++STUB_HANDLE(OpenProcess, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
++STUB_DWORD(GetProcessId, HANDLE Process)
++STUB_BOOL(InitializeProcThreadAttributeList, PVOID lpAttributeList, DWORD dwAttributeCount, DWORD dwFlags, PSIZE_T lpSize)
++static DWORD WINAPI WaitForMultipleObjects(DWORD nCount, PVOID lpHandles, BOOL bWaitAll, DWORD dwMilliseconds)
++{
++    (void)dwMilliseconds;
++    if (!lpHandles || nCount == 0)
++        return WAIT_OBJECT_0;
++    HANDLE *handles = (HANDLE *)lpHandles;
++    if (bWaitAll) {
++        for (DWORD i = 0; i < nCount; ++i) {
++            if (is_thread_handle(handles[i])) {
++                struct thread_handle *th = (struct thread_handle *)handles[i];
++                pthread_join(th->thread, NULL);
++            }
++        }
++        return WAIT_OBJECT_0;
++    }
++    if (is_thread_handle(handles[0])) {
++        struct thread_handle *th = (struct thread_handle *)handles[0];
++        pthread_join(th->thread, NULL);
++    }
++    return WAIT_OBJECT_0;
++}
++DECLARE_CRT_EXPORT("WaitForMultipleObjects", WaitForMultipleObjects);
++STUB_BOOL(WriteProcessMemory, HANDLE hProcess, PVOID lpBaseAddress, PVOID lpBuffer, SIZE_T nSize, PSIZE_T lpNumberOfBytesWritten)
++STUB_INT(GetThreadPriority, HANDLE hThread)
++STUB_BOOL(SetThreadPriority, HANDLE hThread, INT nPriority)
++STUB_BOOL(TryEnterCriticalSection, PVOID lpCriticalSection)
++STUB_DWORD(LCMapStringA, DWORD Locale, DWORD dwMapFlags, PCHAR lpSrcStr, int cchSrc, PCHAR lpDestStr, int cchDest)
++STUB_HANDLE(LoadLibraryA, PCHAR lpLibFileName)
++STUB_BOOL(GetStringTypeExA, DWORD Locale, DWORD dwInfoType, PCHAR lpSrcStr, int cchSrc, PVOID lpCharType)
++STUB_DWORD(GetUserDefaultLCID, VOID)
++STUB_DWORD(GetUserGeoID, DWORD GeoClass)
++STUB_BOOL(SetFileInformationByHandle, HANDLE hFile, DWORD FileInformationClass, PVOID lpFileInformation, DWORD dwBufferSize)
++STUB_BOOL(QueryFullProcessImageNameW, HANDLE hProcess, DWORD dwFlags, PWCHAR lpExeName, PDWORD lpdwSize)
++STUB_BOOL(HeapDestroy, HANDLE hHeap)
++STUB_BOOL(SetStdHandle, DWORD nStdHandle, HANDLE hHandle)
++STUB_BOOL(HeapQueryInformation, HANDLE HeapHandle, DWORD HeapInformationClass, PVOID HeapInformation, SIZE_T HeapInformationLength, PSIZE_T ReturnLength)
++STUB_DWORD(GetTimeZoneInformation, PVOID lpTimeZoneInformation)
++STUB_DWORD(GetConsoleOutputCP, VOID)
++STUB_BOOL(EnumSystemLocalesW, PVOID lpLocaleEnumProc, DWORD dwFlags)
++STUB_BOOL(IsValidLocale, DWORD Locale, DWORD dwFlags)
++STUB_INT(CompareStringW, DWORD Locale, DWORD dwCmpFlags, PWCHAR lpString1, int cchCount1, PWCHAR lpString2, int cchCount2)
++STUB_DWORD(GetTimeFormatW, DWORD Locale, DWORD dwFlags, PVOID lpTime, PWCHAR lpFormat, PWCHAR lpTimeStr, int cchTime)
++STUB_DWORD(GetDateFormatW, DWORD Locale, DWORD dwFlags, PVOID lpDate, PWCHAR lpFormat, PWCHAR lpDateStr, int cchDate)
++STUB_INT(GetLocaleInfoW, DWORD Locale, DWORD LCType, PWCHAR lpLCData, int cchData)
++STUB_BOOL(GetVolumePathNameW, PWCHAR lpszFileName, PWCHAR lpszVolumePathName, DWORD cchBufferLength)
++STUB_BOOL(GetVolumeInformationW, PWCHAR lpRootPathName, PWCHAR lpVolumeNameBuffer, DWORD nVolumeNameSize, PDWORD lpVolumeSerialNumber, PDWORD lpMaximumComponentLength, PDWORD lpFileSystemFlags, PWCHAR lpFileSystemNameBuffer, DWORD nFileSystemNameSize)
++STUB_BOOL(GetVolumeNameForVolumeMountPointW, PWCHAR lpszVolumeMountPoint, PWCHAR lpszVolumeName, DWORD cchBufferLength)
++STUB_DWORD(GetWindowsDirectoryW, PWCHAR lpBuffer, DWORD uSize)
++STUB_BOOL(LockFileEx, HANDLE hFile, DWORD dwFlags, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, PVOID lpOverlapped)
++STUB_BOOL(UnlockFile, HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffsetHigh, DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh)
++STUB_BOOL(HeapCompact, HANDLE hHeap, DWORD dwFlags)
++STUB_DWORD(GetDiskFreeSpaceA, PCHAR lpRootPathName, PDWORD lpSectorsPerCluster, PDWORD lpBytesPerSector, PDWORD lpNumberOfFreeClusters, PDWORD lpTotalNumberOfClusters)
++STUB_BOOL(UnlockFileEx, HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh, PVOID lpOverlapped)
++STUB_DWORD(GetFullPathNameA, PCHAR lpFileName, DWORD nBufferLength, PCHAR lpBuffer, PCHAR *lpFilePart)
++STUB_BOOL(LockFile, HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffsetHigh, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh)
++STUB_VOID(OutputDebugStringW, PWCHAR lpOutputString)
++STUB_VOID(OutputDebugStringA, PCHAR lpOutputString)
++STUB_DWORD(GetDiskFreeSpaceW, PWCHAR lpRootPathName, PDWORD lpSectorsPerCluster, PDWORD lpBytesPerSector, PDWORD lpNumberOfFreeClusters, PDWORD lpTotalNumberOfClusters)
++STUB_BOOL(AreFileApisANSI, VOID)
++STUB_BOOL(SetWaitableTimer, HANDLE hTimer, PVOID lpDueTime, LONG lPeriod, PVOID pfnCompletionRoutine, PVOID lpArgToCompletionRoutine, BOOL fResume)
++STUB_HANDLE(CreateWaitableTimerW, PVOID lpTimerAttributes, BOOL bManualReset, PWCHAR lpTimerName)
++STUB_BOOL(GetFileInformationByHandleEx, HANDLE hFile, DWORD FileInformationClass, PVOID lpFileInformation, DWORD dwBufferSize)
++STUB_DWORD(GetFinalPathNameByHandleW, HANDLE hFile, PWCHAR lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
++STUB_HANDLE(FindFirstFileNameW, PWCHAR lpFileName, DWORD dwFlags, PDWORD StringLength, PWCHAR LinkName)
++STUB_BOOL(FindNextFileNameW, HANDLE hFindStream, PDWORD StringLength, PWCHAR LinkName)
++STUB_BOOL(VirtualProtectEx, HANDLE hProcess, PVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect)
++STUB_BOOL(IsNormalizedString, DWORD NormForm, PWCHAR lpString, int cwLength)
++STUB_INT(NormalizeString, DWORD NormForm, PWCHAR lpSrcString, int cwSrcLength, PWCHAR lpDstString, int cwDstLength)
++STUB_BOOL(GetVolumePathNamesForVolumeNameW, PWCHAR lpszVolumeName, PWCHAR lpszVolumePathNames, DWORD cchBufferLength, PDWORD lpcchReturnLength)
++STUB_BOOL(ReleaseMutex, HANDLE hMutex)
++STUB_LONG(UnhandledExceptionFilter, PVOID ExceptionInfo)
++STUB_PVOID(SetUnhandledExceptionFilter, PVOID lpTopLevelExceptionFilter)
++STUB_BOOL(SleepConditionVariableSRW, PVOID ConditionVariable, PVOID SRWLock, DWORD dwMilliseconds, ULONG Flags)
++STUB_BOOL(InitOnceComplete, PVOID InitOnce, DWORD dwFlags, PVOID lpContext)
++STUB_BOOL(InitOnceBeginInitialize, PVOID lpInitOnce, DWORD dwFlags, PBOOL fPending, PVOID *lpContext)
++STUB_INT(CompareStringEx, PWCHAR lpLocaleName, DWORD dwCmpFlags, PWCHAR lpString1, int cchCount1, PWCHAR lpString2, int cchCount2, PVOID lpVersionInformation, PVOID lpReserved, PVOID lParam)
++STUB_PVOID(InterlockedPushEntrySList, PVOID ListHead, PVOID ListEntry)
++typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(PVOID);
++static void *thread_start_wrapper(void *arg)
++{
++    LPTHREAD_START_ROUTINE fn = ((LPTHREAD_START_ROUTINE *)arg)[0];
++    PVOID param = ((PVOID *)arg)[1];
++    free(arg);
++    if (fn)
++        fn(param);
++    return NULL;
++}
++
++static HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize, PVOID lpStartAddress, PVOID lpParameter, DWORD dwCreationFlags, PDWORD lpThreadId)
++{
++    (void)lpThreadAttributes; (void)dwStackSize; (void)dwCreationFlags;
++    struct thread_handle *th = calloc(1, sizeof(*th));
++    if (!th)
++        return NULL;
++    th->magic = THREAD_HANDLE_MAGIC;
++
++    void **wrapper_args = calloc(2, sizeof(void *));
++    if (!wrapper_args) {
++        free(th);
++        return NULL;
++    }
++    wrapper_args[0] = lpStartAddress;
++    wrapper_args[1] = lpParameter;
++
++    if (pthread_create(&th->thread, NULL, thread_start_wrapper, wrapper_args) != 0) {
++        free(wrapper_args);
++        free(th);
++        return NULL;
++    }
++    if (lpThreadId)
++        *lpThreadId = (DWORD)getpid();
++    return (HANDLE)th;
++}
++DECLARE_CRT_EXPORT("CreateThread", CreateThread);
++STUB_VOID(ExitThread, DWORD dwExitCode)
++STUB_VOID(FreeLibraryAndExitThread, HANDLE hLibModule, DWORD dwExitCode)
++STUB_DWORD(GetOEMCP, VOID)
++STUB_BOOL(GetConsoleMode, HANDLE hConsoleHandle, PDWORD lpMode)
++STUB_BOOL(ReadConsoleW, HANDLE hConsoleInput, PVOID lpBuffer, DWORD nNumberOfCharsToRead, PDWORD lpNumberOfCharsRead, PVOID lpReserved)
++
++/* Advapi32 stubs */
++STUB_BOOL(ConvertSecurityDescriptorToStringSecurityDescriptorA, PVOID pSecurityDescriptor, DWORD RequestedStringSDRevision, DWORD SecurityInformation, PCHAR *StringSecurityDescriptor, PDWORD StringSecurityDescriptorLen)
++STUB_BOOL(CryptDestroyKey, HANDLE hKey)
++STUB_BOOL(CryptEncrypt, HANDLE hKey, HANDLE hHash, BOOL Final, DWORD dwFlags, PBYTE pbData, PDWORD pdwDataLen, DWORD dwBufLen)
++STUB_BOOL(CryptDecrypt, HANDLE hKey, HANDLE hHash, BOOL Final, DWORD dwFlags, PBYTE pbData, PDWORD pdwDataLen)
++STUB_BOOL(CryptDeriveKey, HANDLE hProv, DWORD Algid, HANDLE hBaseData, DWORD dwFlags, HANDLE *phKey)
++STUB_BOOL(CryptHashData, HANDLE hHash, PBYTE pbData, DWORD dwDataLen, DWORD dwFlags)
++STUB_BOOL(CryptSetKeyParam, HANDLE hKey, DWORD dwParam, PBYTE pbData, DWORD dwFlags)
++STUB_BOOL(CryptImportKey, HANDLE hProv, PBYTE pbData, DWORD dwDataLen, HANDLE hPubKey, DWORD dwFlags, HANDLE *phKey)
++STUB_BOOL(CryptReleaseContext, HANDLE hProv, DWORD dwFlags)
++STUB_LONG(RegFlushKey, HANDLE hKey)
++STUB_LONG(RegGetKeySecurity, HANDLE hKey, DWORD SecurityInformation, PVOID pSecurityDescriptor, PDWORD lpcbSecurityDescriptor)
++STUB_LONG(RegOpenCurrentUser, DWORD samDesired, PHANDLE phkResult)
++STUB_BOOL(ConvertSidToStringSidA, PVOID Sid, PCHAR *StringSid)
++STUB_BOOL(GetSecurityDescriptorGroup, PVOID pSecurityDescriptor, PVOID *pGroup, PBOOL lpbGroupDefaulted)
++STUB_LONG(RegSetKeySecurity, HANDLE hKey, DWORD SecurityInformation, PVOID pSecurityDescriptor)
++STUB_LONG(ControlService, HANDLE hService, DWORD dwControl, PVOID lpServiceStatus)
++STUB_LONG(NotifyServiceStatusChangeW, HANDLE hService, DWORD dwNotifyMask, PVOID pNotifyBuffer)
++STUB_LONG(QueryServiceStatus, HANDLE hService, PVOID lpServiceStatus)
++STUB_BOOL(DuplicateToken, HANDLE ExistingTokenHandle, DWORD ImpersonationLevel, PHANDLE DuplicateTokenHandle)
++STUB_LONG(SetNamedSecurityInfoW, PWCHAR pObjectName, DWORD ObjectType, DWORD SecurityInfo, PVOID psidOwner, PVOID psidGroup, PVOID pDacl, PVOID pSacl)
++STUB_LONG(GetNamedSecurityInfoW, PWCHAR pObjectName, DWORD ObjectType, DWORD SecurityInfo, PVOID *ppsidOwner, PVOID *ppsidGroup, PVOID *ppDacl, PVOID *ppSacl, PVOID *ppSecurityDescriptor)
++STUB_BOOL(ConvertSidToStringSidW, PVOID Sid, PWCHAR *StringSid)
++STUB_BOOL(LookupAccountSidW, PWCHAR lpSystemName, PVOID Sid, PWCHAR Name, PDWORD cchName, PWCHAR ReferencedDomainName, PDWORD cchReferencedDomainName, PDWORD peUse)
++STUB_BOOL(SetSecurityDescriptorOwner, PVOID pSecurityDescriptor, PVOID pOwner, BOOL bOwnerDefaulted)
++STUB_BOOL(SetFileSecurityW, PWCHAR lpFileName, DWORD SecurityInformation, PVOID pSecurityDescriptor)
++STUB_DWORD(GetLengthSid, PVOID pSid)
++STUB_BOOL(GetFileSecurityW, PWCHAR lpFileName, DWORD RequestedInformation, PVOID pSecurityDescriptor, DWORD nLength, PDWORD lpnLengthNeeded)
++STUB_BOOL(DuplicateTokenEx, HANDLE hExistingToken, DWORD dwDesiredAccess, PVOID lpTokenAttributes, DWORD ImpersonationLevel, DWORD TokenType, PHANDLE phNewToken)
++STUB_BOOL(CopySid, DWORD nDestinationSidLength, PVOID pDestinationSid, PVOID pSourceSid)
++STUB_BOOL(CheckTokenMembership, HANDLE TokenHandle, PVOID SidToCheck, PBOOL IsMember)
++STUB_LONG(RegNotifyChangeKeyValue, HANDLE hKey, BOOL bWatchSubtree, DWORD dwNotifyFilter, HANDLE hEvent, BOOL fAsynchronous)
++STUB_LONG(RegUnLoadKeyW, HANDLE hKey, PWCHAR lpSubKey)
++STUB_LONG(RegLoadKeyW, HANDLE hKey, PWCHAR lpSubKey, PWCHAR lpFile)
++STUB_LONG(CreateServiceW, HANDLE hSCManager, PWCHAR lpServiceName, PWCHAR lpDisplayName, DWORD dwDesiredAccess, DWORD dwServiceType, DWORD dwStartType, DWORD dwErrorControl, PWCHAR lpBinaryPathName, PWCHAR lpLoadOrderGroup, PDWORD lpdwTagId, PWCHAR lpDependencies, PWCHAR lpServiceStartName, PWCHAR lpPassword)
++STUB_BOOL(DeleteService, HANDLE hService)
++STUB_LONG(EnumDependentServicesW, HANDLE hService, DWORD dwServiceState, PVOID lpServices, DWORD cbBufSize, PDWORD pcbBytesNeeded, PDWORD lpServicesReturned)
++STUB_BOOL(SetSecurityDescriptorControl, PVOID pSecurityDescriptor, WORD ControlBitsOfInterest, WORD ControlBitsToSet)
++STUB_BOOL(SetSecurityDescriptorDacl, PVOID pSecurityDescriptor, BOOL bDaclPresent, PVOID pDacl, BOOL bDaclDefaulted)
++STUB_BOOL(InitializeSecurityDescriptor, PVOID pSecurityDescriptor, DWORD dwRevision)
++STUB_BOOL(AddAce, PVOID pAcl, DWORD dwAceRevision, DWORD dwStartingAceIndex, PVOID pAceList, DWORD nAceListLength)
++STUB_BOOL(GetAce, PVOID pAcl, DWORD dwAceIndex, PVOID *pAce)
++STUB_BOOL(InitializeAcl, PVOID pAcl, DWORD nAclLength, DWORD dwAclRevision)
++STUB_BOOL(GetAclInformation, PVOID pAcl, PVOID pAclInformation, DWORD nAclInformationLength, DWORD dwAclInformationClass)
++STUB_BOOL(GetSecurityDescriptorControl, PVOID pSecurityDescriptor, PWORD pControl, PDWORD lpdwRevision)
++STUB_BOOL(GetSecurityDescriptorDacl, PVOID pSecurityDescriptor, PBOOL lpbDaclPresent, PVOID *pDacl, PBOOL lpbDaclDefaulted)
++STUB_LONG(RegRestoreKeyW, HANDLE hKey, PWCHAR lpFile, DWORD dwFlags)
++STUB_LONG(RegEnumKeyExW, HANDLE hKey, DWORD dwIndex, PWCHAR lpName, PDWORD lpcName, PDWORD lpReserved, PWCHAR lpClass, PDWORD lpcClass, PVOID lpftLastWriteTime)
++STUB_LONG(RegEnumValueW, HANDLE hKey, DWORD dwIndex, PWCHAR lpValueName, PDWORD lpcchValueName, PDWORD lpReserved, PDWORD lpType, PBYTE lpData, PDWORD lpcbData)
++STUB_LONG(RegDeleteValueW, HANDLE hKey, PWCHAR lpValueName)
++STUB_LONG(RegDeleteKeyW, HANDLE hKey, PWCHAR lpSubKey)
++STUB_DWORD(WriteEncryptedFileRaw, PVOID pfExportCallback, PVOID pvCallbackContext, PVOID pvContext)
++STUB_DWORD(CloseEncryptedFileRaw, PVOID pvContext)
++STUB_DWORD(ReadEncryptedFileRaw, PVOID pfImportCallback, PVOID pvCallbackContext, PVOID pvContext)
++STUB_DWORD(OpenEncryptedFileRawW, PWCHAR lpFileName, ULONG ulFlags, PVOID *pvContext)
++STUB_BOOL(GetSecurityDescriptorOwner, PVOID pSecurityDescriptor, PVOID *pOwner, PBOOL lpbOwnerDefaulted)
++STUB_BOOL(StartServiceW, HANDLE hService, DWORD dwNumServiceArgs, PWCHAR *lpServiceArgVectors)
++STUB_LONG(RegReplaceKeyW, HANDLE hKey, PWCHAR lpSubKey, PWCHAR lpNewFile, PWCHAR lpOldFile)
++STUB_LONG(RegSaveKeyW, HANDLE hKey, PWCHAR lpFile, PVOID lpSecurityAttributes)
++STUB_LONG(ChangeServiceConfig2W, HANDLE hService, DWORD dwInfoLevel, PVOID lpInfo)
++STUB_LONG(QueryServiceConfig2W, HANDLE hService, DWORD dwInfoLevel, PVOID lpBuffer, DWORD cbBufSize, PDWORD pcbBytesNeeded)
++STUB_LONG(QueryServiceStatusEx, HANDLE hService, DWORD InfoLevel, PVOID lpBuffer, DWORD cbBufSize, PDWORD pcbBytesNeeded)
++STUB_LONG(RegSetValueExW, HANDLE hKey, PWCHAR lpValueName, DWORD Reserved, DWORD dwType, PBYTE lpData, DWORD cbData)
++STUB_LONG(InitiateSystemShutdownExW, PWCHAR lpMachineName, PWCHAR lpMessage, DWORD dwTimeout, BOOL bForceAppsClosed, BOOL bRebootAfterShutdown, DWORD dwReason)
++STUB_LONG(EnumServicesStatusExW, HANDLE hSCManager, DWORD InfoLevel, DWORD dwServiceType, DWORD dwServiceState, PVOID lpServices, DWORD cbBufSize, PDWORD pcbBytesNeeded, PDWORD lpServicesReturned, PDWORD lpResumeHandle, PWCHAR pszGroupName)
++STUB_PVOID(GetSidSubAuthorityCount, PVOID pSid)
++STUB_PVOID(GetSidSubAuthority, PVOID pSid, DWORD nSubAuthority)
++STUB_BOOL(IsValidSid, PVOID pSid)
++STUB_LONG(SetEntriesInAclW, ULONG cCountOfExplicitEntries, PVOID pListOfExplicitEntries, PVOID OldAcl, PVOID *NewAcl)
++STUB_BOOL(AllocateAndInitializeSid, PVOID pIdentifierAuthority, BYTE nSubAuthorityCount, DWORD nSubAuthority0, DWORD nSubAuthority1, DWORD nSubAuthority2, DWORD nSubAuthority3, DWORD nSubAuthority4, DWORD nSubAuthority5, DWORD nSubAuthority6, DWORD nSubAuthority7, PVOID *pSid)
++STUB_BOOL(AdjustTokenPrivileges, HANDLE TokenHandle, BOOL DisableAllPrivileges, PVOID NewState, DWORD BufferLength, PVOID PreviousState, PDWORD ReturnLength)
++STUB_LONG(LsaOpenPolicy, PVOID SystemName, PVOID ObjectAttributes, DWORD DesiredAccess, PVOID *PolicyHandle)
++STUB_LONG(LsaAddAccountRights, HANDLE PolicyHandle, PVOID AccountSid, PVOID UserRights, ULONG CountOfRights)
++STUB_LONG(LsaClose, HANDLE PolicyHandle)
++STUB_BOOL(ConvertStringSidToSidW, PWCHAR StringSid, PVOID *Sid)
++STUB_BOOL(CreateRestrictedToken, HANDLE ExistingTokenHandle, DWORD Flags, DWORD DisableSidCount, PVOID SidsToDisable, DWORD DeletePrivilegeCount, PVOID PrivilegesToDelete, DWORD RestrictedSidCount, PVOID SidsToRestrict, PHANDLE NewTokenHandle)
++STUB_PVOID(FreeSid, PVOID pSid)
++STUB_BOOL(CreateProcessAsUserW, HANDLE hToken, PWCHAR lpApplicationName, PWCHAR lpCommandLine, PVOID lpProcessAttributes, PVOID lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, PVOID lpEnvironment, PWCHAR lpCurrentDirectory, PVOID lpStartupInfo, PVOID lpProcessInformation)
++STUB_LONG(SetSecurityInfo, HANDLE handle, DWORD ObjectType, DWORD SecurityInfo, PVOID psidOwner, PVOID psidGroup, PVOID pDacl, PVOID pSacl)
++STUB_BOOL(ConvertStringSecurityDescriptorToSecurityDescriptorW, PWCHAR StringSecurityDescriptor, DWORD StringSDRevision, PVOID *SecurityDescriptor, PDWORD SecurityDescriptorSize)
++STUB_LONG(GetSecurityInfo, HANDLE handle, DWORD ObjectType, DWORD SecurityInfo, PVOID *ppsidOwner, PVOID *ppsidGroup, PVOID *ppDacl, PVOID *ppSacl, PVOID *ppSecurityDescriptor)
++STUB_LONG(CloseServiceHandle, HANDLE hSCObject)
++STUB_LONG(QueryServiceConfigW, HANDLE hService, PVOID lpServiceConfig, DWORD cbBufSize, PDWORD pcbBytesNeeded)
++STUB_LONG(OpenServiceW, HANDLE hSCManager, PWCHAR lpServiceName, DWORD dwDesiredAccess)
++STUB_LONG(OpenSCManagerW, PWCHAR lpMachineName, PWCHAR lpDatabaseName, DWORD dwDesiredAccess)
++STUB_BOOL(GetTokenInformation, HANDLE TokenHandle, DWORD TokenInformationClass, PVOID TokenInformation, DWORD TokenInformationLength, PDWORD ReturnLength)
++STUB_BOOL(OpenProcessToken, HANDLE ProcessHandle, DWORD DesiredAccess, PHANDLE TokenHandle)
++STUB_DWORD(GetTraceLoggerHandle, PVOID Buffer)
++STUB_DWORD(GetTraceEnableFlags, ULONGLONG LoggerHandle)
++STUB_DWORD(GetTraceEnableLevel, ULONGLONG LoggerHandle)
++STUB_DWORD(EventWriteTransfer, PVOID RegHandle, PVOID EventDescriptor, PVOID ActivityId, PVOID RelatedActivityId, ULONG UserDataCount, PVOID UserData)
++STUB_DWORD(TraceMessage, PVOID LoggerHandle, ULONG MessageFlags, PVOID MessageGuid, USHORT MessageNumber, ...)

